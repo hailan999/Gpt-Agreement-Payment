@@ -543,7 +543,6 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
         suffix=".json",
         prefix="abcard_register_cfg_",
         delete=False,
-        dir="/tmp",
     ) as tmp_cfg:
         json.dump(ab_cfg, tmp_cfg, ensure_ascii=False, indent=2)
         tmp_cfg.write("\n")
@@ -794,6 +793,13 @@ LOCALE_PROFILES = {
         "browser_language": "nl-NL",
         "color_depth": 24,
         "screen_w": 1920, "screen_h": 1080, "dpr": 1,
+    },
+    "ID": {
+        "browser_locale": "id-ID",
+        "browser_timezone": "Asia/Jakarta",
+        "browser_language": "id-ID",
+        "color_depth": 24,
+        "screen_w": 1366, "screen_h": 768, "dpr": 1,
     },
 }
 
@@ -2438,11 +2444,18 @@ def generate_fresh_checkout(
                     ).upper()
                     processor_entity = "openai_llc" if billing_country == "US" else "openai_ie"
                 provider_url = fresh_url
+                checkout_ui_mode = str(
+                    payload.get("checkout_ui_mode")
+                    if isinstance(payload, dict)
+                    else ""
+                ).lower()
                 canonical_chatgpt_url = (
                     f"https://chatgpt.com/checkout/{processor_entity}/{session_id}"
                     if processor_entity else ""
                 )
-                if canonical_chatgpt_url:
+                if checkout_ui_mode == "hosted" and provider_url:
+                    fresh_url = provider_url
+                elif canonical_chatgpt_url:
                     fresh_url = canonical_chatgpt_url
                 elif not fresh_url and processor_entity:
                     fresh_url = canonical_chatgpt_url

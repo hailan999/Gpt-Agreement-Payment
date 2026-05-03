@@ -59,6 +59,40 @@ def _build_pkce_pair(raw_bytes: int = 64) -> tuple[str, str]:
     return verifier, challenge
 
 
+def _goto_with_retry(page, url: str, *, wait_until: str = "domcontentloaded", timeout: int = 60000, attempts: int = 3):
+    last_error = None
+    retry_markers = (
+        "NS_ERROR_NET_INTERRUPT",
+        "NS_ERROR_NET_RESET",
+        "NS_ERROR_NET_TIMEOUT",
+        "ERR_CONNECTION_RESET",
+        "ERR_TUNNEL_CONNECTION_FAILED",
+        "Timeout",
+        "timeout",
+    )
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            return page.goto(url, wait_until=wait_until, timeout=timeout)
+        except Exception as e:
+            last_error = e
+            msg = str(e)
+            retryable = any(marker in msg for marker in retry_markers)
+            if attempt >= attempts or not retryable:
+                raise
+            delay = min(2.0 * attempt, 6.0)
+            logger.warning(
+                f"[browser-reg] 打开 {url} 失败({attempt}/{attempts}): "
+                f"{msg.splitlines()[0][:140]}，{delay:.1f}s 后重试"
+            )
+            try:
+                page.goto("about:blank", wait_until="commit", timeout=10000)
+            except Exception:
+                pass
+            time.sleep(delay)
+    if last_error:
+        raise last_error
+
+
 def _parse_proxy(proxy_url: str):
     """Camoufox 需要 socks5 + 无 auth 的格式。socks5 + auth 需要走 gost 中继。"""
     if not proxy_url:
@@ -129,14 +163,14 @@ def browser_register(cfg, mail_provider) -> dict:
             os="windows",
             screen=Screen(max_width=1920, max_height=1080),
             proxy=cf_proxy,
-            geoip=True,
+            geoip=bool(getattr(cfg, "camoufox_geoip", True)),
             locale="en-US",
         ) as ctx:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
             # [1] 打开 ChatGPT 首页，点 "Sign up for free"
             logger.info("[browser-reg] 打开 ChatGPT 首页 ...")
-            page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+            _goto_with_retry(page, "https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
             # 等 React 渲染完成 + Sign up 按钮可交互
             try:
                 page.wait_for_selector('button[data-testid="signup-button"], a[data-testid="signup-button"]',
@@ -226,6 +260,7 @@ def browser_register(cfg, mail_provider) -> dict:
                     raise
             time.sleep(random.uniform(0.5, 1.2))
             # Continue
+            otp_accept_from = time.time() - 5
             for sel in ['button[type="submit"]', 'button:has-text("Continue")',
                         'button:has-text("Next")']:
                 b = page.query_selector(sel)
@@ -240,7 +275,7 @@ def browser_register(cfg, mail_provider) -> dict:
             try:
                 page.wait_for_selector(
                     'input[type="password"], input[name="password"]',
-                    state="visible", timeout=30000,
+                    state="visible", timeout=10000,
                 )
                 pwd_input = page.query_selector('input[type="password"]:visible') or \
                             page.query_selector('input[name="password"]:visible')
@@ -283,7 +318,7 @@ def browser_register(cfg, mail_provider) -> dict:
             if page.query_selector('input[autocomplete="one-time-code"]') or \
                page.query_selector('input[inputmode="numeric"]'):
                 logger.info("[browser-reg] 等待 IMAP OTP ...")
-                otp_sent_at = time.time()
+                otp_sent_at = otp_accept_from
                 try:
                     otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "180")))
                 except Exception:

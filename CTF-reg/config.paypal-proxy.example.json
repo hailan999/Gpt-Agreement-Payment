@@ -45,6 +45,7 @@
     "client_key": "YOUR_CAPTCHA_API_KEY"
   },
   "proxy": "socks5://USER:PASS@PROXY_HOST:PORT",
+  "camoufox_geoip": true,
   "session_token": "",
   "access_token": "",
   "device_id": "",

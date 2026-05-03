@@ -175,6 +175,7 @@ def write_configs(answers: dict) -> dict:
     auth = pay_skeleton.setdefault("fresh_checkout", {}).setdefault("auth", {})
     auto = auth.setdefault("auto_register", {})
     auto["config_path"] = str(s.REG_CONFIG_PATH)
+    auto["persist_to"] = str(s.get_data_dir() / "ctf_last_paypal_auth.json")
 
     pay = _deep_merge(pay_skeleton, _project_pay(answers))
     reg = _deep_merge(reg_skeleton, _project_reg(answers))

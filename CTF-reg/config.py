@@ -79,6 +79,7 @@ class Config:
     team_plan: TeamPlanConfig = field(default_factory=TeamPlanConfig)
     captcha: CaptchaConfig = field(default_factory=CaptchaConfig)
     proxy: Optional[str] = None
+    camoufox_geoip: bool = True
     # 已有凭证（可选，跳过注册直接支付时使用）
     session_token: Optional[str] = None
     access_token: Optional[str] = None
@@ -90,8 +91,12 @@ class Config:
     def from_file(cls, path: str) -> "Config":
         """从 JSON 文件加载配置"""
         import dataclasses
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except UnicodeDecodeError:
+            with open(path, "r", encoding="gbk") as f:
+                data = json.load(f)
         cfg = cls()
         if "mail" in data:
             # 过滤已废弃的 IMAP/SMTP 字段（imap_server, imap_port, smtp_*,
@@ -109,6 +114,7 @@ class Config:
         if "captcha" in data:
             cfg.captcha = CaptchaConfig(**data["captcha"])
         cfg.proxy = data.get("proxy")
+        cfg.camoufox_geoip = bool(data.get("camoufox_geoip", cfg.camoufox_geoip))
         cfg.session_token = data.get("session_token")
         cfg.access_token = data.get("access_token")
         cfg.device_id = data.get("device_id")
@@ -123,6 +129,7 @@ class Config:
             "team_plan": self.team_plan.__dict__,
             "captcha": self.captcha.__dict__,
             "proxy": self.proxy,
+            "camoufox_geoip": self.camoufox_geoip,
             "session_token": self.session_token,
             "access_token": self.access_token,
             "device_id": self.device_id,

@@ -624,21 +624,35 @@ class GoPayCharger:
     def _chatgpt_verify(self, cs_id: str) -> dict:
         """Poll chatgpt verify until plan is active."""
         deadline = time.time() + 60
+        last_error = ""
         while time.time() < deadline:
-            r = self.cs.get(
-                "https://chatgpt.com/checkout/verify",
-                params={
-                    "stripe_session_id": cs_id,
-                    "processor_entity": "openai_llc",
-                    "plan_type": "plus",
-                },
-                timeout=DEFAULT_TIMEOUT,
-                allow_redirects=True,
-            )
+            try:
+                r = self.cs.get(
+                    "https://chatgpt.com/checkout/verify",
+                    params={
+                        "stripe_session_id": cs_id,
+                        "processor_entity": "openai_llc",
+                        "plan_type": "plus",
+                    },
+                    timeout=DEFAULT_TIMEOUT,
+                    allow_redirects=True,
+                )
+            except Exception as e:
+                last_error = str(e).splitlines()[0][:240]
+                self.log(f"[gopay] chatgpt verify network error: {last_error}")
+                time.sleep(3)
+                continue
             if r.status_code == 200:
                 self.log("[gopay] chatgpt verify ok")
                 return {"state": "succeeded", "cs_id": cs_id}
             time.sleep(2)
+        if last_error:
+            self.log("[gopay] charge settled; chatgpt verify failed after network errors")
+            return {
+                "state": "verify_error_after_settled",
+                "cs_id": cs_id,
+                "error": last_error,
+            }
         return {"state": "verify_timeout", "cs_id": cs_id}
 
     # ───── Top-level driver ─────

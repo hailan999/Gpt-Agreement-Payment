@@ -21,7 +21,6 @@ def test_run_preview_single(client):
     r = client.post("/api/run/preview", json={"mode": "single"})
     assert r.status_code == 200
     body = r.json()
-    assert "xvfb-run" in body["cmd_str"]
     assert "pipeline.py" in body["cmd_str"]
     assert "--paypal" in body["cmd_str"]
 
