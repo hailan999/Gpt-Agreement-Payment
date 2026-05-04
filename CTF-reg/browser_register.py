@@ -590,7 +590,11 @@ def browser_register(cfg, mail_provider) -> dict:
                 result["refresh_token"] = result.get("refresh_token", "") or ""
             else:
                 try:
-                    codex_client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
+                    codex_client_id = (os.getenv("OAUTH_CODEX_CLIENT_ID", "") or "").strip()
+                    if not codex_client_id or codex_client_id.startswith("YOUR_"):
+                        logger.info("[browser-reg] 缺少有效 OAUTH_CODEX_CLIENT_ID，跳过 signup 态 Codex OAuth")
+                        result["refresh_token"] = result.get("refresh_token", "") or ""
+                        raise RuntimeError("missing OAUTH_CODEX_CLIENT_ID")
                     codex_redirect = "http://localhost:1455/auth/callback"
                     codex_scope = "openid email profile offline_access"
                     codex_state = _b64url_no_pad(secrets.token_bytes(24))

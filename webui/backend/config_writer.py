@@ -2,6 +2,7 @@ import json
 import time
 from pathlib import Path
 from . import settings as s
+from . import wa_relay
 
 
 def _deep_merge(dst: dict, src: dict) -> dict:
@@ -38,6 +39,8 @@ def _project_pay(answers: dict) -> dict:
         }
     if "team_system" in answers:
         out["team_system"] = answers["team_system"]
+    if "cpa" in answers:
+        out["cpa"] = answers["cpa"]
     if pm == "gopay" and "gopay" in answers:
         gp = answers["gopay"] or {}
         if all(gp.get(k) for k in ("country_code", "phone_number", "pin")):
@@ -48,6 +51,12 @@ def _project_pay(answers: dict) -> dict:
             }
             if gp.get("midtrans_client_id"):
                 out["gopay"]["midtrans_client_id"] = gp["midtrans_client_id"]
+            out["gopay"]["otp"] = {
+                "source": "file",
+                "path": str(wa_relay.otp_path()),
+                "timeout": int(gp.get("otp_timeout") or 300),
+                "interval": 1,
+            }
     if "team_plan" in answers:
         tp = answers["team_plan"] or {}
         plan: dict = {}
@@ -60,6 +69,9 @@ def _project_pay(answers: dict) -> dict:
             "seat_quantity",
             "billing_country",
             "billing_currency",
+            "checkout_ui_mode",
+            "output_url_mode",
+            "is_coupon_from_query_param",
         ):
             if k in tp and tp[k] not in (None, ""):
                 plan[k] = tp[k]

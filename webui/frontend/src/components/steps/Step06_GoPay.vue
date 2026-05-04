@@ -8,10 +8,17 @@
       <TermField v-model="form.country_code" label="国家码 · country_code" placeholder="86 (中国大陆) / 62 (印尼)" />
       <TermField v-model="form.phone_number" label="手机号 · phone_number" placeholder="不带国家码，11 位数字" />
       <TermField v-model="form.pin" label="6 位 PIN · pin" type="password" placeholder="登录 GoJek/GoPay 时设的 PIN" />
+      <TermField v-model.number="form.otp_timeout" label="OTP 等待超时秒数" type="number" />
     </div>
 
+    <RouterLink class="wa-login-entry" to="/whatsapp">
+      <span class="wa-login-prompt">$</span>
+      WhatsApp 登录 / 扫码接收 GoPay OTP
+    </RouterLink>
+
     <div class="hint-box">
-      <p>WhatsApp OTP 在运行页弹模态框输入；PIN 配置后自动用，绑定 + 扣款各用一次。</p>
+      <p>前端只保留上面的 WhatsApp 登录入口。扫码连接后，后台会自动监听 WhatsApp 消息并把 GoPay OTP 写给支付流程读取。</p>
+      <p>PIN 配置后自动用，绑定 + 扣款各用一次。</p>
       <p>同号重复绑定时第一次会返 406「account already linked」，gopay.py 会自动重试一次。</p>
     </div>
   </section>
@@ -19,15 +26,18 @@
 
 <script setup lang="ts">
 import { ref, watch } from "vue";
+import { RouterLink } from "vue-router";
 import { useWizardStore } from "../../stores/wizard";
 import TermField from "../term/TermField.vue";
 
 const store = useWizardStore();
 const init = store.answers.gopay ?? {};
+const initOtp = init.otp ?? {};
 const form = ref({
   country_code: init.country_code ?? "86",
   phone_number: init.phone_number ?? "",
   pin: init.pin ?? "",
+  otp_timeout: init.otp_timeout ?? initOtp.timeout ?? 300,
 });
 
 watch(form, () => {
@@ -46,4 +56,23 @@ watch(form, () => {
   color: var(--fg-tertiary);
 }
 .hint-box p { margin: 4px 0; }
+.wa-login-entry {
+  margin-top: 18px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  background: rgba(93, 255, 174, 0.06);
+  text-decoration: none;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 700;
+}
+.wa-login-entry:hover {
+  background: rgba(93, 255, 174, 0.12);
+}
+.wa-login-prompt {
+  color: var(--fg-primary);
+}
 </style>

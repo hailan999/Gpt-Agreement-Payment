@@ -52,7 +52,7 @@
             <TermToggle v-model="form.register_only" :disabled="form.pay_only">--register-only</TermToggle>
           </div>
           <p v-if="!isFreeMode" class="ctl-hint">
-            <code>--pay-only</code> 跳过注册，复用 config 里的 session_token；
+            <code>--pay-only</code> 跳过注册，优先复用最近注册但未支付账号；
             <code>--register-only</code> 只注册不支付。
           </p>
           <p v-else class="ctl-hint">

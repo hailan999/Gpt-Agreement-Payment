@@ -117,3 +117,21 @@ def test_run_start_then_409(client, monkeypatch):
 
     # Cleanup module state
     runner_mod._proc = None
+
+
+def test_gopay_auto_otp_skips_manual_fifo(tmp_path, monkeypatch):
+    import json
+    import webui.backend.runner as runner_mod
+
+    cfg = tmp_path / "pay.json"
+    cfg.write_text(json.dumps({
+        "gopay": {
+            "otp": {
+                "source": "http",
+                "url": "http://127.0.0.1:8765/latest",
+            },
+        },
+    }))
+    monkeypatch.setattr(runner_mod.s, "PAY_CONFIG_PATH", cfg)
+
+    assert runner_mod._gopay_auto_otp_enabled() is True

@@ -381,6 +381,53 @@ def test_file_watch_otp_timeout(tmp_path):
         provider()
 
 
+# ────────────────── WhatsApp auto OTP providers ──────────────────
+
+
+def test_extract_otp_from_whatsapp_text():
+    text = "Kode verifikasi GoPay Anda adalah 123456. Jangan bagikan kode ini."
+    assert gopay._extract_otp_from_text(text) == "123456"
+
+
+def test_whatsapp_file_otp_provider_reads_state(tmp_path):
+    state = tmp_path / "wa_state.json"
+    provider = gopay.whatsapp_file_otp_provider(
+        state,
+        timeout=5.0,
+        interval=0.1,
+        log=lambda _m: None,
+    )
+
+    import threading
+    def writer():
+        time.sleep(0.2)
+        state.write_text(
+            '{"latest":{"otp":"246810","ts": %s, "text":"GoPay code 246810"}}'
+            % int(time.time()),
+            encoding="utf-8",
+        )
+
+    threading.Thread(target=writer, daemon=True).start()
+    assert provider() == "246810"
+
+
+@responses.activate
+def test_whatsapp_http_otp_provider_reads_latest():
+    url = "http://127.0.0.1:8765/latest"
+    responses.get(url, status=204)
+    responses.get(
+        url,
+        json={"otp": "135790", "ts": int(time.time()), "text": "GoPay OTP 135790"},
+    )
+    provider = gopay.whatsapp_http_otp_provider(
+        url,
+        timeout=5.0,
+        interval=0.1,
+        log=lambda _m: None,
+    )
+    assert provider() == "135790"
+
+
 # ────────────────── chatgpt session builder ──────────────────
 
 

@@ -1,0 +1,32 @@
+{
+  "gopay": {
+    "_comment": "GoPay 支付配置。默认不填 otp 时会回退到 CLI/WebUI 手动输入 WhatsApp OTP；WebUI WhatsApp 登录 sidecar 默认写 output/wa_otp.txt。",
+    "country_code": "62",
+    "phone_number": "81234567890",
+    "pin": "YOUR_6_DIGIT_GOPAY_PIN",
+    "otp": {
+      "source": "file",
+      "path": "output/wa_otp.txt",
+      "timeout": 300,
+      "interval": 1,
+      "code_regex": "(?<!\\d)(\\d{6})(?!\\d)",
+      "issued_after_slack_s": 15
+    }
+  },
+  "fresh_checkout": {
+    "auth": {
+      "cookie_header": "",
+      "session_token": "",
+      "access_token": "",
+      "device_id": "",
+      "mode": "access_token"
+    }
+  },
+  "runtime": {
+    "confirm_mode": "shared_payment_method",
+    "version": "fed52f3bc6",
+    "js_checksum": "FILL_FROM_CURRENT_STRIPE_CHECKOUT",
+    "rv_timestamp": "FILL_FROM_CURRENT_STRIPE_CHECKOUT"
+  },
+  "proxy": ""
+}

@@ -3,7 +3,7 @@
 
 Replays Stripe → Midtrans → GoPay's tokenization linking + charge in pure
 HTTP. No browser needed. WhatsApp OTP delivered via injected callback
-(stdin for CLI, file-watch for webui runner).
+(stdin for CLI, file-watch for webui runner, or configured WhatsApp relay).
 
 Flow (15 steps):
 
@@ -34,8 +34,11 @@ Flow (15 steps):
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import json
 import re
+import shlex
+import subprocess
 import sys
 import time
 import uuid
@@ -78,6 +81,7 @@ GOPAY_PIN_CLIENT_ID_CHARGE = "47180a8e-f56e-11ed-a05b-0242ac120003-GWC"
 DEFAULT_TIMEOUT = 30
 LINK_RETRY_LIMIT = 2  # 406 "account already linked" retry
 LINK_RETRY_SLEEP_S = 12.0  # Midtrans 需要冷却 ~10s 才会让 406 → 201（实测）
+DEFAULT_OTP_REGEX = r"(?<!\d)(\d{6})(?!\d)"
 
 
 # ──────────────────────────── exceptions ──────────────────────────
@@ -737,6 +741,405 @@ def file_watch_otp_provider(watch_path: Path, timeout: float = 300.0) -> Callabl
     return provider
 
 
+def _clean_otp_candidate(value: Any) -> str:
+    code = re.sub(r"\D", "", str(value or ""))
+    if 4 <= len(code) <= 8:
+        return code
+    return ""
+
+
+def _extract_otp_from_text(text: str, code_regex: str = DEFAULT_OTP_REGEX) -> str:
+    """Extract the most likely WhatsApp OTP from a text blob.
+
+    Keyword-aware patterns run before the generic regex to avoid confusing
+    amounts / phone numbers with OTPs in verbose WhatsApp messages.
+    """
+    if not text:
+        return ""
+    patterns = [
+        r"(?:otp|one[-\s]*time|verification|verify|code|kode|verifikasi|gopay|whatsapp|验证码|驗證碼)[^\d]{0,80}(\d{4,8})(?!\d)",
+        r"(?<!\d)(\d{4,8})(?!\d)[^\n\r]{0,80}(?:otp|one[-\s]*time|verification|verify|code|kode|verifikasi|gopay|验证码|驗證碼)",
+        code_regex or DEFAULT_OTP_REGEX,
+    ]
+    for pattern in patterns:
+        try:
+            matches = list(re.finditer(pattern, text, flags=re.IGNORECASE | re.DOTALL))
+        except re.error:
+            continue
+        for match in reversed(matches):
+            groups = match.groups() or (match.group(0),)
+            for group in reversed(groups):
+                code = _clean_otp_candidate(group)
+                if code:
+                    return code
+    return ""
+
+
+def _json_path_get(obj: Any, path: str) -> Any:
+    cur = obj
+    for part in (path or "").split("."):
+        part = part.strip()
+        if not part:
+            continue
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        elif isinstance(cur, list) and part.isdigit():
+            idx = int(part)
+            if idx >= len(cur):
+                return None
+            cur = cur[idx]
+        else:
+            return None
+    return cur
+
+
+def _parse_payload_timestamp(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 1_000_000_000_000:  # milliseconds
+            ts /= 1000.0
+        if 946684800 <= ts <= 4102444800:  # 2000-01-01 .. 2100-01-01
+            return ts
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d{10,13}", text):
+        return _parse_payload_timestamp(float(text))
+    try:
+        return _dt.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _dict_timestamp(obj: dict) -> Optional[float]:
+    for key in ("ts", "timestamp", "time", "created_at", "received_at", "date"):
+        if key in obj:
+            ts = _parse_payload_timestamp(obj.get(key))
+            if ts is not None:
+                return ts
+    return None
+
+
+def _iter_json_message_candidates(obj: Any) -> Any:
+    """Yield (text, timestamp) candidates from generic relay / Meta webhook JSON."""
+    if isinstance(obj, dict):
+        ts = _dict_timestamp(obj)
+        pieces: list[str] = []
+        for key in ("otp", "code", "body", "message", "text", "content", "caption", "raw"):
+            if key not in obj:
+                continue
+            value = obj.get(key)
+            if isinstance(value, dict):
+                body = value.get("body") or value.get("text") or value.get("message")
+                if body not in (None, ""):
+                    pieces.append(str(body))
+            elif isinstance(value, (str, int, float)):
+                pieces.append(str(value))
+        if pieces:
+            yield " ".join(pieces), ts
+        for value in obj.values():
+            yield from _iter_json_message_candidates(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _iter_json_message_candidates(item)
+    elif isinstance(obj, str):
+        yield obj, None
+
+
+def _extract_otp_from_payload(
+    payload: Any,
+    *,
+    code_regex: str = DEFAULT_OTP_REGEX,
+    json_path: str = "",
+    issued_after: float = 0.0,
+) -> str:
+    if isinstance(payload, str):
+        stripped = payload.strip()
+        if stripped[:1] in ("{", "["):
+            try:
+                payload = json.loads(stripped)
+            except Exception:
+                return _extract_otp_from_text(payload, code_regex=code_regex)
+        else:
+            return _extract_otp_from_text(payload, code_regex=code_regex)
+
+    if json_path:
+        target = _json_path_get(payload, json_path)
+        if target is None:
+            return ""
+        if not isinstance(target, str):
+            target = json.dumps(target, ensure_ascii=False)
+        return _extract_otp_from_text(target, code_regex=code_regex)
+
+    found = ""
+    for text, ts in _iter_json_message_candidates(payload):
+        if issued_after and ts is not None and ts < issued_after:
+            continue
+        code = _extract_otp_from_text(text, code_regex=code_regex)
+        if code:
+            found = code
+    return found
+
+
+def _float_cfg(cfg: dict, key: str, default: float) -> float:
+    try:
+        return float(cfg.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _headers_cfg(raw: Any) -> dict:
+    return raw if isinstance(raw, dict) else {}
+
+
+def whatsapp_file_otp_provider(
+    path: Path,
+    *,
+    timeout: float = 300.0,
+    interval: float = 1.0,
+    code_regex: str = DEFAULT_OTP_REGEX,
+    json_path: str = "",
+    issued_after_slack_s: float = 15.0,
+    delete_after_read: bool = False,
+    log: Callable[[str], None] = print,
+) -> Callable[[], str]:
+    """Poll a local WhatsApp relay state/log file and extract a fresh OTP."""
+
+    def provider() -> str:
+        issued_after = time.time() - max(0.0, issued_after_slack_s)
+        deadline = time.time() + timeout
+        last_error = ""
+        log(f"[gopay] waiting WhatsApp OTP from file: {path}")
+        while time.time() < deadline:
+            try:
+                if path.exists():
+                    stat = path.stat()
+                    if stat.st_mtime >= issued_after:
+                        text = path.read_text(encoding="utf-8", errors="replace")
+                        code = _extract_otp_from_payload(
+                            text,
+                            code_regex=code_regex,
+                            json_path=json_path,
+                            issued_after=issued_after,
+                        )
+                        if code:
+                            if delete_after_read:
+                                try:
+                                    path.unlink()
+                                except FileNotFoundError:
+                                    pass
+                            return code
+                last_error = ""
+            except Exception as exc:
+                last_error = str(exc)
+            time.sleep(max(0.2, interval))
+        detail = f"; last_error={last_error}" if last_error else ""
+        raise OTPCancelled(f"OTP timeout after {timeout}s (file={path}{detail})")
+
+    return provider
+
+
+def whatsapp_http_otp_provider(
+    url: str,
+    *,
+    timeout: float = 300.0,
+    interval: float = 1.0,
+    headers: Optional[dict] = None,
+    params: Optional[dict] = None,
+    code_regex: str = DEFAULT_OTP_REGEX,
+    json_path: str = "",
+    issued_after_slack_s: float = 15.0,
+    log: Callable[[str], None] = print,
+) -> Callable[[], str]:
+    """Poll a local/owned WhatsApp relay HTTP endpoint for the latest OTP.
+
+    The endpoint may return plain text or JSON. JSON can either expose the code
+    directly (for example {"otp":"123456"}) or contain a WhatsApp Cloud API-like
+    message payload; timestamps are honored when present.
+    """
+
+    def provider() -> str:
+        issued_after = time.time() - max(0.0, issued_after_slack_s)
+        deadline = time.time() + timeout
+        sess = requests.Session()
+        base_params = dict(params or {})
+        last_error = ""
+        log(f"[gopay] waiting WhatsApp OTP from relay: {url}")
+        while time.time() < deadline:
+            try:
+                req_params = dict(base_params)
+                if "since" not in req_params:
+                    req_params["since"] = str(int(issued_after))
+                resp = sess.get(
+                    url,
+                    headers=headers or {},
+                    params=req_params,
+                    timeout=min(10.0, max(2.0, interval + 1.0)),
+                )
+                if resp.status_code in (204, 404):
+                    time.sleep(max(0.2, interval))
+                    continue
+                resp.raise_for_status()
+                try:
+                    payload: Any = resp.json()
+                except ValueError:
+                    payload = resp.text
+                code = _extract_otp_from_payload(
+                    payload,
+                    code_regex=code_regex,
+                    json_path=json_path,
+                    issued_after=issued_after,
+                )
+                if code:
+                    return code
+                last_error = ""
+            except Exception as exc:
+                last_error = str(exc)
+            time.sleep(max(0.2, interval))
+        detail = f"; last_error={last_error}" if last_error else ""
+        raise OTPCancelled(f"OTP timeout after {timeout}s (url={url}{detail})")
+
+    return provider
+
+
+def command_otp_provider(
+    command: Any,
+    *,
+    timeout: float = 300.0,
+    interval: float = 2.0,
+    code_regex: str = DEFAULT_OTP_REGEX,
+    log: Callable[[str], None] = print,
+) -> Callable[[], str]:
+    """Poll a user-owned command that prints the latest WhatsApp OTP."""
+    argv = command if isinstance(command, list) else shlex.split(str(command or ""))
+    if not argv:
+        raise GoPayError("gopay.otp.command is empty")
+
+    def provider() -> str:
+        deadline = time.time() + timeout
+        last_error = ""
+        log(f"[gopay] waiting WhatsApp OTP from command: {argv[0]}")
+        while time.time() < deadline:
+            try:
+                proc = subprocess.run(
+                    argv,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=min(20.0, max(2.0, interval + 1.0)),
+                    check=False,
+                )
+                text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                code = _extract_otp_from_text(text, code_regex=code_regex)
+                if code:
+                    return code
+                if proc.returncode not in (0, 1):
+                    last_error = f"exit={proc.returncode}: {text.strip()[:160]}"
+            except Exception as exc:
+                last_error = str(exc)
+            time.sleep(max(0.2, interval))
+        detail = f"; last_error={last_error}" if last_error else ""
+        raise OTPCancelled(f"OTP timeout after {timeout}s (command{detail})")
+
+    return provider
+
+
+def build_configured_otp_provider(
+    gopay_cfg: dict,
+    *,
+    fallback_provider: Callable[[], str] = cli_otp_provider,
+    log: Callable[[str], None] = print,
+) -> Callable[[], str]:
+    """Build OTP provider from gopay.otp config, falling back to manual input.
+
+    Supported config:
+      "gopay": {
+        "otp": {
+          "source": "http" | "file" | "command" | "manual" | "auto",
+          "url": "http://127.0.0.1:8765/latest",
+          "path": "output/wa_state.json",
+          "command": ["python", "scripts/get_wa_otp.py"],
+          "timeout": 300,
+          "interval": 1,
+          "code_regex": "(?<!\\d)(\\d{6})(?!\\d)",
+          "issued_after_slack_s": 15
+        }
+      }
+    """
+    otp_cfg = gopay_cfg.get("otp") or gopay_cfg.get("otp_provider") or {}
+    if not isinstance(otp_cfg, dict) or not otp_cfg:
+        return fallback_provider
+
+    source = str(otp_cfg.get("source") or otp_cfg.get("type") or "auto").strip().lower()
+    if source in ("", "manual", "cli", "stdin"):
+        return fallback_provider
+
+    timeout = _float_cfg(otp_cfg, "timeout", _float_cfg(otp_cfg, "timeout_s", 300.0))
+    interval = _float_cfg(otp_cfg, "interval", _float_cfg(otp_cfg, "poll_interval_s", 1.0))
+    code_regex = str(otp_cfg.get("code_regex") or DEFAULT_OTP_REGEX)
+    json_path = str(otp_cfg.get("json_path") or "")
+    slack = _float_cfg(otp_cfg, "issued_after_slack_s", 15.0)
+
+    url = str(otp_cfg.get("url") or otp_cfg.get("relay_url") or "").strip()
+    path = str(
+        otp_cfg.get("path")
+        or otp_cfg.get("state_file")
+        or otp_cfg.get("log_file")
+        or ""
+    ).strip()
+    command = otp_cfg.get("command") or otp_cfg.get("cmd")
+
+    if source in ("auto", "http", "https", "relay", "whatsapp_http", "wa_http"):
+        if url:
+            return whatsapp_http_otp_provider(
+                url,
+                timeout=timeout,
+                interval=interval,
+                headers=_headers_cfg(otp_cfg.get("headers")),
+                params=otp_cfg.get("params") if isinstance(otp_cfg.get("params"), dict) else None,
+                code_regex=code_regex,
+                json_path=json_path,
+                issued_after_slack_s=slack,
+                log=log,
+            )
+        if source != "auto":
+            raise GoPayError("gopay.otp source=http requires url")
+
+    if source in ("auto", "file", "state_file", "log", "whatsapp_file", "wa_file"):
+        if path:
+            return whatsapp_file_otp_provider(
+                Path(path).expanduser(),
+                timeout=timeout,
+                interval=interval,
+                code_regex=code_regex,
+                json_path=json_path,
+                issued_after_slack_s=slack,
+                delete_after_read=bool(otp_cfg.get("delete_after_read", False)),
+                log=log,
+            )
+        if source != "auto":
+            raise GoPayError("gopay.otp source=file requires path/state_file/log_file")
+
+    if source in ("auto", "command", "cmd"):
+        if command:
+            return command_otp_provider(
+                command,
+                timeout=timeout,
+                interval=interval,
+                code_regex=code_regex,
+                log=log,
+            )
+        if source != "auto":
+            raise GoPayError("gopay.otp source=command requires command")
+
+    if source == "auto":
+        return fallback_provider
+    raise GoPayError(f"unsupported gopay.otp source: {source}")
+
+
 # ──────────────────────────── chatgpt session ─────────────────────
 
 
@@ -855,7 +1258,7 @@ def main():
     if args.otp_file:
         provider = file_watch_otp_provider(Path(args.otp_file), timeout=args.otp_timeout)
     else:
-        provider = cli_otp_provider
+        provider = build_configured_otp_provider(gopay_cfg, fallback_provider=cli_otp_provider)
 
     charger = GoPayCharger(
         cs_session, gopay_cfg,
