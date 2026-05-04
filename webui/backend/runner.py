@@ -37,6 +37,7 @@ _seq_counter = 0
 _otp_file: Optional[Path] = None       # legacy file provider path, if used
 _otp_to_db: bool = False               # True when gopay.py waits on WebUI SQLite OTP endpoint
 _otp_pending: bool = False             # set when gopay.py asks/waits for OTP
+_otp_pending_since: float = 0.0
 _otp_file_is_temp: bool = False
 
 
@@ -126,6 +127,7 @@ def status() -> dict:
         "pid": _proc.pid if is_running and _proc else None,
         "log_count": _seq_counter,
         "otp_pending": _otp_pending,
+        "otp_pending_since": _otp_pending_since if _otp_pending else 0.0,
     }
 
 
@@ -202,7 +204,7 @@ def _detect_otp_wait_target(line: str) -> tuple[str, Optional[Path]]:
 
 
 def _drain(proc: subprocess.Popen) -> None:
-    global _ended_at, _exit_code, _seq_counter, _log_lines, _otp_pending, _otp_file, _otp_to_db, _otp_file_is_temp
+    global _ended_at, _exit_code, _seq_counter, _log_lines, _otp_pending, _otp_pending_since, _otp_file, _otp_to_db, _otp_file_is_temp
     try:
         if proc.stdout is None:
             return
@@ -224,6 +226,8 @@ def _drain(proc: subprocess.Popen) -> None:
                     _otp_to_db = wait_kind == "db"
                     _otp_file = wait_path
                     _otp_file_is_temp = _otp_file_is_temp or "GOPAY_OTP_REQUEST" in line
+                    if not _otp_pending:
+                        _otp_pending_since = time.time()
                     _otp_pending = True
     finally:
         proc.wait()
@@ -231,6 +235,7 @@ def _drain(proc: subprocess.Popen) -> None:
             _ended_at = time.time()
             _exit_code = proc.returncode
             _otp_pending = False
+            _otp_pending_since = 0.0
             # Cleanup OTP file.  For the auto relay path this intentionally
             # removes stale OTPs too; future waits use mtime checks, but an
             # empty/clean file is easier to reason about.
@@ -258,7 +263,7 @@ def stop() -> dict:
 
 def submit_otp(value: str) -> dict:
     """Front-end calls this with the OTP user typed. Stores it in DB by default."""
-    global _otp_pending
+    global _otp_pending, _otp_pending_since
     with _lock:
         if not _otp_pending:
             raise RuntimeError("no OTP currently requested")
@@ -273,6 +278,16 @@ def submit_otp(value: str) -> dict:
         path.write_text(value.strip(), encoding="utf-8")
     with _lock:
         _otp_pending = False
+        _otp_pending_since = 0.0
+    return status()
+
+
+def mark_otp_received() -> dict:
+    """Called when WhatsApp/notify already supplied the pending GoPay OTP."""
+    global _otp_pending, _otp_pending_since
+    with _lock:
+        _otp_pending = False
+        _otp_pending_since = 0.0
     return status()
 
 

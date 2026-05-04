@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 from ..auth import CurrentUser
 from .. import runner
+from .. import wa_relay
 from ..config_health import build_config_health, health_error_message
 
 router = APIRouter(prefix="/api/run", tags=["run"])
@@ -77,6 +78,7 @@ async def stream(user: str = CurrentUser):
 
     async def gen():
         nonlocal last_seq
+        last_otp_event_id = ""
         # Backlog: 先推最近 200 行
         for entry in runner.get_tail(200):
             last_seq = max(last_seq, entry["seq"])
@@ -91,6 +93,20 @@ async def stream(user: str = CurrentUser):
             st = runner.status()
             # OTP heartbeat: re-send periodically while pending
             if st.get("otp_pending"):
+                item = wa_relay.latest_otp(since=float(st.get("otp_pending_since") or 0.0))
+                if item:
+                    event_id = str(item.get("id") or item.get("ts") or item.get("otp") or "")
+                    if event_id != last_otp_event_id:
+                        last_otp_event_id = event_id
+                        runner.mark_otp_received()
+                        yield {
+                            "event": "otp_received",
+                            "data": json.dumps({
+                                "source": item.get("source") or item.get("engine") or "whatsapp",
+                                "from": item.get("from") or "",
+                            }),
+                        }
+                    continue
                 yield {"event": "otp_pending", "data": json.dumps({"pending": True})}
             if not st["running"]:
                 # 进程已退出，再扫一次确保没遗漏，然后发 done

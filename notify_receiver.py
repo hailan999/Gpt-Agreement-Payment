@@ -265,6 +265,7 @@ def sync_webui_gopay_otp(record: dict[str, Any]) -> str:
     item = {
         "otp": code,
         "ts": ts,
+        "received_ts": float(record.get("received_ts") or time.time()),
         "from": str(payload.get("package") or payload.get("from") or "com.whatsapp"),
         "source": "android_notification",
         "engine": "notify_receiver",

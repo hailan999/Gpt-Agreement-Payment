@@ -13,7 +13,7 @@
       "description": "Profile page Account & app settings row"
     },
     "linked_apps": {
-      "ratio": [0.43, 0.59],
+      "ratio": [0.43, 0.89],
       "description": "Account & app settings page Linked apps row"
     },
     "first_linked_app": {

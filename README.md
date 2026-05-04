@@ -79,14 +79,23 @@ python scripts/gopay_adb_unlink.py --adb "E:\leidian\LDPlayer9\adb.exe" --device
 页面停在 `Account & app settings`。如果你的雷电安装路径或设备号不同，替换
 `--adb` 和 `--device` 的值。
 
-pipeline 集成点在 `[CPA] ... 本地 JSON 已保存` 之后。要让 pipeline 自动执行
-同一套解绑流程，可在支付配置的 `cpa` 下加入：
+如果同时打开两个雷电实例，通常 `雷电模拟器` 对应 `emulator-5554`，
+`雷电模拟器-1` 对应 `emulator-5556`。要在 `雷电模拟器-1` 里解绑，请把
+`--device` 或配置里的 `device` 改成 `emulator-5556`。
+
+新版 GoPay 的 `Account & app settings` 中间多了 `Your data` 和
+`Account activity`，`Linked apps` 位置更靠下；当前默认坐标已按新版 UI
+适配。
+
+pipeline 集成点在 `[CPA] ... 本地 JSON 已保存` 之后；如果 GoPay 支付链路失败
+或返回非 `succeeded` 状态，也会尝试执行同一套解绑流程，覆盖“已经绑定但后续
+失败”的情况。要让 pipeline 自动执行，可在支付配置的 `cpa` 下加入：
 
 ```json
 "gopay_unlink": {
   "enabled": true,
   "adb_path": "E:\\leidian\\LDPlayer9\\adb.exe",
-  "device": "emulator-5554",
+  "device": "emulator-5556",
   "flow": "unlink_first_app_from_account_settings"
 }
 ```

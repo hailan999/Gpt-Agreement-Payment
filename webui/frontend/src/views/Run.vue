@@ -766,6 +766,11 @@ function openStream() {
     try {
       const entry = JSON.parse((e as MessageEvent).data);
       lines.value.push(entry);
+      const line = String(entry?.line || "").toLowerCase();
+      if (line.includes("[gopay] whatsapp otp received")) {
+        otpDialog.value.open = false;
+        otpDialog.value.value = "";
+      }
       if (lines.value.length > 5000) lines.value.splice(0, 1000);
       if (autoScroll.value) {
         nextTick(() => {
@@ -779,6 +784,10 @@ function openStream() {
       otpDialog.value.open = true;
       otpDialog.value.value = "";
     }
+  });
+  eventSource.addEventListener("otp_received", () => {
+    otpDialog.value.open = false;
+    otpDialog.value.value = "";
   });
   eventSource.addEventListener("done", async () => {
     eventSource?.close();

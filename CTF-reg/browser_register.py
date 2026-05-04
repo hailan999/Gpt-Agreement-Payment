@@ -597,6 +597,11 @@ def browser_register(cfg, mail_provider) -> dict:
             else:
                 page.screenshot(path="/tmp/browser_reg_no_name_form.png")
                 logger.warning(f"[browser-reg] 未找到 about-you 表单，URL={page.url[:120]}")
+                if "auth.openai.com/about-you" in page.url:
+                    raise RuntimeError(
+                        "[browser-reg-retryable] about-you 表单不完整，"
+                        f"本轮需要从头重试: inputs={len(visible_metas)} url={page.url[:180]}"
+                    )
 
             # [7] 等待回到 chatgpt.com (可能有中间页如 email-verification / success-page)
             logger.info("[browser-reg] 等待跳转回 chatgpt.com ...")

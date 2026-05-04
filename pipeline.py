@@ -24,12 +24,14 @@ import argparse
 import base64
 import json
 import os
+import queue
 import random
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -645,15 +647,31 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
     lines = []
     try:
         deadline = time.time() + timeout
-        for line in proc.stdout:
+        stdout_q = _start_stdout_reader(proc)
+        while True:
+            try:
+                raw_line = stdout_q.get(timeout=1)
+            except queue.Empty:
+                if time.time() > deadline:
+                    _kill_proc(proc)
+                    raise RegistrationError("注册超时")
+                if proc.poll() is not None:
+                    break
+                continue
+            if raw_line is None:
+                break
+            line = raw_line
             line = line.rstrip("\n")
             lines.append(line)
             print(f"  [reg] {line}")
+            if "[browser-reg-retryable]" in line or "未跳转回 chatgpt.com" in line:
+                _kill_proc(proc)
+                raise RegistrationError(f"注册可重试失败，跳过本轮: {line[:200]}")
             if line.startswith("LOCALAUTH_RESULT_JSON="):
                 payload = line.split("=", 1)[1]
                 result_json = json.loads(payload)
             if time.time() > deadline:
-                proc.kill()
+                _kill_proc(proc)
                 raise RegistrationError("注册超时")
     finally:
         proc.wait()
@@ -687,6 +705,27 @@ class PaymentError(RuntimeError):
 class DatadomeSliderError(PaymentError):
     """PayPal 页面被 DataDome 可见滑块拦截，需要换 IP 重试。"""
     pass
+
+
+def _start_stdout_reader(proc: subprocess.Popen) -> queue.Queue:
+    q: queue.Queue = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            for raw in proc.stdout:
+                q.put(raw)
+        finally:
+            q.put(None)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    return q
+
+
+def _kill_proc(proc: subprocess.Popen) -> None:
+    try:
+        proc.kill()
+    except Exception:
+        pass
 
 
 def _codex_oauth_client_id_from_card_cfg(cfg: dict) -> str:
@@ -823,13 +862,28 @@ def pay(card_config_path, session_token=None, access_token=None,
 
     result_json = None
     datadome_slider = False
+    rt_login_hits = 0
+    rt_login_first_ts = 0.0
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", env=env,
         )
         deadline = time.time() + timeout
-        for line in proc.stdout:
+        stdout_q = _start_stdout_reader(proc)
+        while True:
+            try:
+                raw_line = stdout_q.get(timeout=1)
+            except queue.Empty:
+                if time.time() > deadline:
+                    _kill_proc(proc)
+                    raise PaymentError("支付超时")
+                if proc.poll() is not None:
+                    break
+                continue
+            if raw_line is None:
+                break
+            line = raw_line
             line = line.rstrip("\n")
             print(f"  [pay] {line}")
             if line.startswith(result_marker):
@@ -837,8 +891,17 @@ def pay(card_config_path, session_token=None, access_token=None,
                 result_json = json.loads(payload)
             if "CARD_DATADOME_SLIDER=1" in line:
                 datadome_slider = True
+            if "[RT] URL: https://auth.openai.com/log-in" in line:
+                now = time.time()
+                if not rt_login_first_ts or now - rt_login_first_ts > 90:
+                    rt_login_first_ts = now
+                    rt_login_hits = 0
+                rt_login_hits += 1
+                if rt_login_hits >= 4 and now - rt_login_first_ts >= 30:
+                    _kill_proc(proc)
+                    raise PaymentError("Codex RT 阶段反复停在 auth.openai.com/log-in，跳过本轮")
             if time.time() > deadline:
-                proc.kill()
+                _kill_proc(proc)
                 raise PaymentError("支付超时")
         proc.wait()
     finally:
@@ -950,11 +1013,17 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
             }
         except PaymentError as e:
             record["payment"] = {"status": "error", "email": reg.get("email", ""), "error": str(e)[:200]}
+            if use_gopay:
+                cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
+                _gopay_unlink_after_flow_failure(reg.get("email", ""), cpa_cfg, str(e)[:120])
             _append_result(record)
             raise
 
         # Step 3: 支付成功 → gpt-team 导入 + invite 探测
         pay_status = pay_result.get("status", "unknown")
+        if use_gopay and pay_status != "succeeded":
+            cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
+            _gopay_unlink_after_flow_failure(reg.get("email", ""), cpa_cfg, pay_status)
         if pay_status == "succeeded" and team_client:
             try:
                 probe_status = _team_probe_after_payment(
@@ -1376,6 +1445,8 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
         pay_email = _norm_email(email or raw.get("chatgpt_email") or raw.get("email"))
         record["payment"] = {"status": status, "email": pay_email}
         cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
+        if use_gopay and status != "succeeded":
+            _gopay_unlink_after_flow_failure(pay_email, cpa_cfg, status)
         if status == "succeeded" and cpa_cfg.get("enabled"):
             try:
                 sid = raw.get("session_id", "") if isinstance(raw, dict) else ""
@@ -1388,6 +1459,9 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
         return result
     except PaymentError as e:
         record["payment"] = {"status": "error", "email": email, "error": str(e)[:200]}
+        if use_gopay:
+            cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
+            _gopay_unlink_after_flow_failure(email, cpa_cfg, str(e)[:120])
         _append_result(record)
         raise
 
@@ -2788,8 +2862,8 @@ def _cfg_truthy(value) -> bool:
     return bool(value)
 
 
-def _gopay_unlink_after_cpa_json(email: str, cpa_cfg: dict) -> None:
-    """CPA 本地 JSON 落盘后，best-effort 触发 GoPay Linked apps 解绑。"""
+def _run_gopay_unlink(email: str, cpa_cfg: dict, reason: str) -> None:
+    """Best-effort 触发 GoPay Linked apps 解绑。"""
     unlink_cfg = cpa_cfg.get("gopay_unlink") or {}
     enabled = _cfg_truthy(unlink_cfg.get("enabled")) or _env_truthy("GOPAY_ADB_UNLINK")
     if not enabled:
@@ -2836,7 +2910,7 @@ def _gopay_unlink_after_cpa_json(email: str, cpa_cfg: dict) -> None:
             cmd.extend(["--set-ratio", f"{name}={value}"])
     cmd.extend(["run-flow", flow, "--execute", "--allow-unlink", "--yes"])
 
-    print(f"[GoPay unlink] {email} CPA JSON 已保存，开始解绑 Linked apps")
+    print(f"[GoPay unlink] {email} {reason}，开始解绑 Linked apps")
     try:
         proc = subprocess.run(
             cmd,
@@ -2855,6 +2929,16 @@ def _gopay_unlink_after_cpa_json(email: str, cpa_cfg: dict) -> None:
     else:
         err = (proc.stderr or proc.stdout or "").strip()
         print(f"[GoPay unlink] ✗ {email} 解绑流程失败 rc={proc.returncode} {err[:500]}")
+
+
+def _gopay_unlink_after_cpa_json(email: str, cpa_cfg: dict) -> None:
+    """CPA 本地 JSON 落盘后，best-effort 触发 GoPay Linked apps 解绑。"""
+    _run_gopay_unlink(email, cpa_cfg, "CPA JSON 已保存")
+
+
+def _gopay_unlink_after_flow_failure(email: str, cpa_cfg: dict, reason: str) -> None:
+    """GoPay 支付链路失败后也尝试解绑，覆盖已绑定但后续失败的情况。"""
+    _run_gopay_unlink(email, cpa_cfg, f"流程失败({reason})")
 
 
 def _cpa_import_after_team(

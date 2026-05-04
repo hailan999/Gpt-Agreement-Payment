@@ -280,14 +280,19 @@ def submit_manual_otp(value: str) -> dict:
 
 
 def latest_otp(since: float = 0.0) -> dict | None:
-    latest = (_read_state().get("latest") or {})
+    state = _read_state()
+    latest = (state.get("latest") or {})
     if not isinstance(latest, dict) or not latest.get("otp"):
         return None
     try:
         ts = float(latest.get("ts") or 0.0)
     except Exception:
         ts = 0.0
-    if since and ts < since:
+    try:
+        received_ts = float(latest.get("received_ts") or 0.0)
+    except Exception:
+        received_ts = 0.0
+    if since and max(ts, received_ts) < since:
         return None
     return latest
 

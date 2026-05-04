@@ -975,6 +975,7 @@ def whatsapp_file_otp_provider(
                             issued_after=issued_after,
                         )
                         if code:
+                            log(f"[gopay] WhatsApp OTP received from file (len={len(code)})")
                             if delete_after_read:
                                 try:
                                     path.unlink()
@@ -1043,6 +1044,7 @@ def whatsapp_http_otp_provider(
                     issued_after=issued_after,
                 )
                 if code:
+                    log(f"[gopay] WhatsApp OTP received from relay (len={len(code)})")
                     return code
                 last_error = ""
             except Exception as exc:
@@ -1084,6 +1086,7 @@ def command_otp_provider(
                 text = (proc.stdout or "") + "\n" + (proc.stderr or "")
                 code = _extract_otp_from_text(text, code_regex=code_regex)
                 if code:
+                    log(f"[gopay] WhatsApp OTP received from command (len={len(code)})")
                     return code
                 if proc.returncode not in (0, 1):
                     last_error = f"exit={proc.returncode}: {text.strip()[:160]}"
