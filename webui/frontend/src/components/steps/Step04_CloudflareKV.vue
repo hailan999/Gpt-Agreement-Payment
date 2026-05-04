@@ -44,7 +44,7 @@
           </span>
         </li>
         <li v-if="deployResult.secrets_path" class="row-ok">
-          <span class="row-name">secrets.json</span>
+          <span class="row-name">SQLite runtime_meta[secrets]</span>
           <span class="row-msg">已落 {{ deployResult.secrets_path }}</span>
         </li>
       </ul>

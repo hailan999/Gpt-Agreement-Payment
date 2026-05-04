@@ -1,29 +1,22 @@
 import json
 import sys
 import types
-from pathlib import Path
 
 import pipeline
+from webui.backend.db import get_db
 
 
-def _write_jsonl(path: Path, rows: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
-        encoding="utf-8",
-    )
+def _reset_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("WEBUI_DATA_DIR", str(tmp_path))
+    db = get_db()
+    db.clear_runtime_data()
+    return db
 
 
 def test_pay_only_selects_latest_registered_unpaid_account(tmp_path, monkeypatch):
-    registered = tmp_path / "registered_accounts.jsonl"
-    pipeline_batch = tmp_path / "pipeline_batch.jsonl"
-    card_results = tmp_path / "results.jsonl"
+    db = _reset_db(tmp_path, monkeypatch)
 
-    monkeypatch.setattr(pipeline, "REGISTERED_ACCOUNTS_FILE", registered)
-    monkeypatch.setattr(pipeline, "RESULTS_FILE", pipeline_batch)
-    monkeypatch.setattr(pipeline, "CARD_RESULTS_FILE", card_results)
-
-    _write_jsonl(registered, [
+    for row in [
         {
             "ts": "2026-05-03T01:00:00+00:00",
             "email": "paid@example.com",
@@ -45,18 +38,16 @@ def test_pay_only_selects_latest_registered_unpaid_account(tmp_path, monkeypatch
             "access_token": "",
             "device_id": "dev-noauth",
         },
-    ])
-    _write_jsonl(pipeline_batch, [
-        {
-            "registration": {"status": "ok", "email": "paid@example.com"},
-            "payment": {"status": "succeeded", "email": "paid@example.com"},
-        },
-        {
-            "registration": {"status": "ok", "email": "retry@example.com"},
-            "payment": {"status": "error", "email": "retry@example.com", "error": "OTP timeout"},
-        },
-    ])
-    _write_jsonl(card_results, [])
+    ]:
+        db.add_registered_account(row)
+    db.add_pipeline_result({
+        "registration": {"status": "ok", "email": "paid@example.com"},
+        "payment": {"status": "succeeded", "email": "paid@example.com"},
+    })
+    db.add_pipeline_result({
+        "registration": {"status": "ok", "email": "retry@example.com"},
+        "payment": {"status": "error", "email": "retry@example.com", "error": "OTP timeout"},
+    })
 
     selected = pipeline._select_recent_registered_account_for_pay_only()
     assert selected is not None
@@ -66,29 +57,18 @@ def test_pay_only_selects_latest_registered_unpaid_account(tmp_path, monkeypatch
 
 
 def test_pay_only_treats_already_paid_error_as_consumed(tmp_path, monkeypatch):
-    registered = tmp_path / "registered_accounts.jsonl"
-    pipeline_batch = tmp_path / "pipeline_batch.jsonl"
-    card_results = tmp_path / "results.jsonl"
+    db = _reset_db(tmp_path, monkeypatch)
 
-    monkeypatch.setattr(pipeline, "REGISTERED_ACCOUNTS_FILE", registered)
-    monkeypatch.setattr(pipeline, "RESULTS_FILE", pipeline_batch)
-    monkeypatch.setattr(pipeline, "CARD_RESULTS_FILE", card_results)
-
-    _write_jsonl(registered, [
-        {"email": "older@example.com", "session_token": "sess-older", "access_token": ""},
-        {"email": "latest@example.com", "session_token": "sess-latest", "access_token": ""},
-    ])
-    _write_jsonl(pipeline_batch, [
-        {
-            "registration": {"status": "ok", "email": "latest@example.com"},
-            "payment": {
-                "status": "error",
-                "email": "latest@example.com",
-                "error": '生成 fresh checkout 失败: modern [400]: {"detail":"User is already paid"}',
-            },
+    db.add_registered_account({"email": "older@example.com", "session_token": "sess-older", "access_token": ""})
+    db.add_registered_account({"email": "latest@example.com", "session_token": "sess-latest", "access_token": ""})
+    db.add_pipeline_result({
+        "registration": {"status": "ok", "email": "latest@example.com"},
+        "payment": {
+            "status": "error",
+            "email": "latest@example.com",
+            "error": '生成 fresh checkout 失败: modern [400]: {"detail":"User is already paid"}',
         },
-    ])
-    _write_jsonl(card_results, [])
+    })
 
     selected = pipeline._select_recent_registered_account_for_pay_only()
     assert selected is not None
@@ -96,25 +76,15 @@ def test_pay_only_treats_already_paid_error_as_consumed(tmp_path, monkeypatch):
 
 
 def test_pay_only_success_imports_cpa_with_plus_tag(tmp_path, monkeypatch):
-    registered = tmp_path / "registered_accounts.jsonl"
-    pipeline_batch = tmp_path / "pipeline_batch.jsonl"
-    card_results = tmp_path / "results.jsonl"
+    db = _reset_db(tmp_path, monkeypatch)
     card_config = tmp_path / "config.paypal.json"
 
-    monkeypatch.setattr(pipeline, "REGISTERED_ACCOUNTS_FILE", registered)
-    monkeypatch.setattr(pipeline, "RESULTS_FILE", pipeline_batch)
-    monkeypatch.setattr(pipeline, "CARD_RESULTS_FILE", card_results)
-
-    _write_jsonl(registered, [
-        {
-            "email": "retry@example.com",
-            "session_token": "sess-retry",
-            "access_token": "at-retry",
-            "device_id": "dev-retry",
-        },
-    ])
-    _write_jsonl(pipeline_batch, [])
-    _write_jsonl(card_results, [])
+    db.add_registered_account({
+        "email": "retry@example.com",
+        "session_token": "sess-retry",
+        "access_token": "at-retry",
+        "device_id": "dev-retry",
+    })
     card_config.write_text(json.dumps({
         "fresh_checkout": {"plan": {"plan_name": "chatgptplusplan"}},
         "cpa": {
@@ -152,23 +122,16 @@ def test_pay_only_success_imports_cpa_with_plus_tag(tmp_path, monkeypatch):
     assert email == "retry@example.com"
     assert sid == "cs_test"
     assert cpa_cfg["plan_tag"] == "plus"
-    record = json.loads(pipeline_batch.read_text(encoding="utf-8").strip())
-    assert record["cpa_import"] == "ok"
+    rows = get_db().iter_pipeline_results()
+    assert rows[-1]["cpa_import"] == "ok"
 
 
 def test_cpa_import_falls_back_to_access_token_without_refresh_token(tmp_path, monkeypatch):
-    registered = tmp_path / "registered_accounts.jsonl"
-    monkeypatch.setattr(pipeline, "REGISTERED_ACCOUNTS_FILE", registered)
-    monkeypatch.setattr(
-        pipeline,
-        "_load_registered_accounts",
-        lambda: [
-            {
-                "email": "fallback@example.com",
-                "access_token": "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifSwiZXhwIjoyNTM0MDk0NDAwfQ.sig",
-            }
-        ],
-    )
+    db = _reset_db(tmp_path, monkeypatch)
+    db.add_registered_account({
+        "email": "fallback@example.com",
+        "access_token": "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifSwiZXhwIjoyNTM0MDk0NDAwfQ.sig",
+    })
     monkeypatch.setattr(pipeline, "_find_latest_refresh_token_for_email", lambda *args, **kwargs: "")
 
     fake_calls = []

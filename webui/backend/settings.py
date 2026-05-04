@@ -5,7 +5,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = Path(os.environ.get("WEBUI_DATA_DIR", ROOT / "output"))
 
 DB_PATH = DATA_DIR / "webui.db"
-WIZARD_STATE_PATH = DATA_DIR / "webui_wizard_state.json"
+WIZARD_STATE_KEY = "wizard_state"
 
 
 def get_data_dir() -> Path:

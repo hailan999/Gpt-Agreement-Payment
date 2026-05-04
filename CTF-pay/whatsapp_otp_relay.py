@@ -4,7 +4,7 @@
 This process does not log in to WhatsApp by itself. It receives messages from a
 user-controlled source (for example Meta WhatsApp Cloud API webhook, an Android
 notification forwarder, or another local WhatsApp bridge), extracts the latest
-OTP, stores it in a local JSON state file, and exposes `/latest` for
+OTP, stores it in SQLite runtime_meta[wa_state], and exposes `/latest` for
 `gopay.py` to poll.
 
 Examples:
@@ -43,7 +43,12 @@ from gopay import (  # local module
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_STATE_FILE = ROOT / "output" / "wa_state.json"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from webui.backend.db import get_db  # noqa: E402
+
+DEFAULT_STATE_KEY = "wa_state"
 DEFAULT_LOG_FILE = ROOT / "output" / "wa_relay.log"
 
 _lock = threading.Lock()
@@ -53,24 +58,16 @@ def _now() -> float:
     return time.time()
 
 
-def _load_state(path: Path) -> dict:
-    if not path.exists():
-        return {"latest": None, "history": []}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            data.setdefault("history", [])
-            return data
-    except Exception:
-        pass
+def _load_state(state_key: str = DEFAULT_STATE_KEY) -> dict:
+    data = get_db().get_runtime_json(state_key, {"latest": None, "history": []})
+    if isinstance(data, dict):
+        data.setdefault("history", [])
+        return data
     return {"latest": None, "history": []}
 
 
-def _atomic_write_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+def _save_state(data: dict, state_key: str = DEFAULT_STATE_KEY) -> None:
+    get_db().set_runtime_json(state_key, data if isinstance(data, dict) else {})
 
 
 def _append_log(path: Path, line: str) -> None:
@@ -152,14 +149,14 @@ def _iter_events(payload: Any) -> Any:
 def _store_events(
     events: list[dict],
     *,
-    state_file: Path,
+    state_key: str,
     log_file: Path,
     history_limit: int,
     code_regex: str,
 ) -> int:
     stored = 0
     with _lock:
-        state = _load_state(state_file)
+        state = _load_state(state_key)
         history = state.setdefault("history", [])
         for event in events:
             code = _extract_otp_from_payload(event, code_regex=code_regex)
@@ -182,7 +179,7 @@ def _store_events(
             )
         if len(history) > history_limit:
             state["history"] = history[-history_limit:]
-        _atomic_write_json(state_file, state)
+        _save_state(state, state_key)
     return stored
 
 
@@ -205,7 +202,7 @@ def _text_response(handler: BaseHTTPRequestHandler, status: int, body: str) -> N
 
 
 class RelayHandler(BaseHTTPRequestHandler):
-    state_file: Path = DEFAULT_STATE_FILE
+    state_key: str = DEFAULT_STATE_KEY
     log_file: Path = DEFAULT_LOG_FILE
     verify_token: str = ""
     history_limit: int = 50
@@ -234,7 +231,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         if parsed.path == "/latest":
             since = _parse_payload_timestamp(qs.get("since", [""])[0]) or 0.0
             with _lock:
-                latest = (_load_state(self.state_file).get("latest") or {})
+                latest = (_load_state(self.state_key).get("latest") or {})
             if not latest:
                 self.send_response(204)
                 self.end_headers()
@@ -268,7 +265,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         events = list(_iter_events(payload))
         stored = _store_events(
             events,
-            state_file=self.state_file,
+            state_key=self.state_key,
             log_file=self.log_file,
             history_limit=self.history_limit,
             code_regex=self.code_regex,
@@ -280,26 +277,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Local WhatsApp OTP relay for GoPay")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--state-file", default=str(DEFAULT_STATE_FILE))
+    parser.add_argument("--state-key", default=DEFAULT_STATE_KEY, help="SQLite runtime_meta key")
     parser.add_argument("--log-file", default=str(DEFAULT_LOG_FILE))
     parser.add_argument("--verify-token", default="", help="Meta webhook verify token")
     parser.add_argument("--history", type=int, default=50)
     parser.add_argument("--code-regex", default=DEFAULT_OTP_REGEX)
     args = parser.parse_args()
 
-    RelayHandler.state_file = Path(args.state_file).expanduser()
+    RelayHandler.state_key = args.state_key
     RelayHandler.log_file = Path(args.log_file).expanduser()
     RelayHandler.verify_token = args.verify_token
     RelayHandler.history_limit = max(1, args.history)
     RelayHandler.code_regex = args.code_regex
 
-    RelayHandler.state_file.parent.mkdir(parents=True, exist_ok=True)
     RelayHandler.log_file.parent.mkdir(parents=True, exist_ok=True)
 
     server = ThreadingHTTPServer((args.host, args.port), RelayHandler)
     print(
         f"[wa-relay] listening http://{args.host}:{args.port} "
-        f"state={RelayHandler.state_file}",
+        f"state=sqlite:runtime_meta/{RelayHandler.state_key}",
         flush=True,
     )
     try:

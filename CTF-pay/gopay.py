@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -1059,8 +1060,8 @@ def build_configured_otp_provider(
       "gopay": {
         "otp": {
           "source": "http" | "file" | "command" | "manual" | "auto",
-          "url": "http://127.0.0.1:8765/latest",
-          "path": "output/wa_state.json",
+          "url": "http://127.0.0.1:8765/api/whatsapp/latest-otp?token=...",
+          "url": "http://127.0.0.1:8765/api/whatsapp/latest-otp?token=...",
           "command": ["python", "scripts/get_wa_otp.py"],
           "timeout": 300,
           "interval": 1,
@@ -1083,7 +1084,8 @@ def build_configured_otp_provider(
     json_path = str(otp_cfg.get("json_path") or "")
     slack = _float_cfg(otp_cfg, "issued_after_slack_s", 15.0)
 
-    url = str(otp_cfg.get("url") or otp_cfg.get("relay_url") or "").strip()
+    env_url = os.getenv("WEBUI_GOPAY_OTP_URL", "").strip()
+    url = str(otp_cfg.get("url") or otp_cfg.get("relay_url") or env_url or "").strip()
     path = str(
         otp_cfg.get("path")
         or otp_cfg.get("state_file")
@@ -1092,21 +1094,18 @@ def build_configured_otp_provider(
     ).strip()
     command = otp_cfg.get("command") or otp_cfg.get("cmd")
 
-    if source in ("auto", "http", "https", "relay", "whatsapp_http", "wa_http"):
-        if url:
-            return whatsapp_http_otp_provider(
-                url,
-                timeout=timeout,
-                interval=interval,
-                headers=_headers_cfg(otp_cfg.get("headers")),
-                params=otp_cfg.get("params") if isinstance(otp_cfg.get("params"), dict) else None,
-                code_regex=code_regex,
-                json_path=json_path,
-                issued_after_slack_s=slack,
-                log=log,
-            )
-        if source != "auto":
-            raise GoPayError("gopay.otp source=http requires url")
+    if url and (source in ("auto", "http", "https", "relay", "whatsapp_http", "wa_http") or env_url):
+        return whatsapp_http_otp_provider(
+            url,
+            timeout=timeout,
+            interval=interval,
+            headers=_headers_cfg(otp_cfg.get("headers")),
+            params=otp_cfg.get("params") if isinstance(otp_cfg.get("params"), dict) else None,
+            code_regex=code_regex,
+            json_path=json_path,
+            issued_after_slack_s=slack,
+            log=log,
+        )
 
     if source in ("auto", "file", "state_file", "log", "whatsapp_file", "wa_file"):
         if path:

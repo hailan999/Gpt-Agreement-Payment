@@ -131,7 +131,7 @@ cp CTF-reg/config.example.json              CTF-reg/config.noproxy.json
 ```json
 {
   "mail": {
-    "_comment": "OTP 走 CF Email Worker → KV，凭证在 output/secrets.json，这里只配 catch-all 域名",
+    "_comment": "OTP 走 CF Email Worker → KV，凭证在 SQLite runtime_meta[secrets]，这里只配 catch-all 域名",
     "catch_all_domain": "subdomain.example.com",
     "catch_all_domains": ["subdomain.example.com"],
     "auto_provision": {
@@ -156,7 +156,7 @@ cp CTF-reg/config.example.json              CTF-reg/config.noproxy.json
 > 注册和 PayPal 登录的 OTP 邮件都经 Cloudflare Email Routing → `otp-relay`
 > Worker → KV 落库（毫秒级，见 [`scripts/setup_cf_email_worker.py`](../scripts/setup_cf_email_worker.py) 一键部署 + [`scripts/otp_email_worker.js`](../scripts/otp_email_worker.js)）。
 >
-> 一次性配好后，OTP 凭证写到 `output/secrets.json`：
+> 一次性配好后，OTP 凭证写到 `SQLite runtime_meta[secrets]`：
 >
 > ```json
 > {

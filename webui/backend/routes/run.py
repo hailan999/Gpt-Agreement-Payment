@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 from ..auth import CurrentUser
 from .. import runner
+from ..config_health import build_config_health, health_error_message
 
 router = APIRouter(prefix="/api/run", tags=["run"])
 
@@ -32,6 +33,19 @@ def get_status(user: str = CurrentUser):
 
 @router.post("/start")
 def start(req: StartRequest, user: str = CurrentUser):
+    if req.mode == "batch" and req.batch < 1:
+        raise HTTPException(status_code=400, detail="batch 模式下批次数必须 ≥ 1")
+    if req.mode == "self_dealer" and req.self_dealer < 1:
+        raise HTTPException(status_code=400, detail="self_dealer 模式下成员数必须 ≥ 1")
+    health = build_config_health(req.model_dump())
+    if not health.get("ok"):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": health_error_message(health) or "配置健康检查未通过",
+                "health": health,
+            },
+        )
     try:
         return runner.start(**req.model_dump())
     except RuntimeError as e:

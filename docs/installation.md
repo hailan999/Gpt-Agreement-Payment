@@ -83,7 +83,7 @@ cp CTF-reg/config.example.json              CTF-reg/config.noproxy.json
    - `Zone` → `DNS` → `Edit`
    - `Zone` → `Zone` → `Read`
 4. Zone Resources 选你要管的 zone
-5. 创建后写到 `output/secrets.json`：
+5. 创建后写到 `SQLite runtime_meta[secrets]`：
 
 ```json
 {

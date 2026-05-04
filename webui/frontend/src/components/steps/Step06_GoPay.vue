@@ -9,6 +9,11 @@
       <TermField v-model="form.phone_number" label="手机号 · phone_number" placeholder="不带国家码，11 位数字" />
       <TermField v-model="form.pin" label="6 位 PIN · pin" type="password" placeholder="登录 GoJek/GoPay 时设的 PIN" />
       <TermField v-model.number="form.otp_timeout" label="OTP 等待超时秒数" type="number" />
+      <TermSelect
+        v-model="form.whatsapp_engine"
+        label="WhatsApp 引擎"
+        :options="engineOptions"
+      />
     </div>
 
     <RouterLink class="wa-login-entry" to="/whatsapp">
@@ -29,6 +34,7 @@ import { ref, watch } from "vue";
 import { RouterLink } from "vue-router";
 import { useWizardStore } from "../../stores/wizard";
 import TermField from "../term/TermField.vue";
+import TermSelect from "../term/TermSelect.vue";
 
 const store = useWizardStore();
 const init = store.answers.gopay ?? {};
@@ -38,7 +44,13 @@ const form = ref({
   phone_number: init.phone_number ?? "",
   pin: init.pin ?? "",
   otp_timeout: init.otp_timeout ?? initOtp.timeout ?? 300,
+  whatsapp_engine: init.whatsapp_engine ?? "baileys",
 });
+
+const engineOptions = [
+  { value: "baileys", label: "Baileys (推荐)", desc: "直连 WhatsApp multi-device socket，启动更轻" },
+  { value: "wwebjs", label: "whatsapp-web.js", desc: "Chromium 路径，兼容旧环境 / 调试用" },
+];
 
 watch(form, () => {
   store.setAnswer("gopay", form.value);

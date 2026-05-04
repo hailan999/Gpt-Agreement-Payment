@@ -11,7 +11,7 @@ Worker（scripts/otp_email_worker.js）会把 OTP 解析后存到 KV：
 
 Configuration（按优先级）：
   1. env vars: CF_API_TOKEN / CF_ACCOUNT_ID / CF_OTP_KV_NAMESPACE_ID
-  2. output/secrets.json: cloudflare.{api_token, account_id, otp_kv_namespace_id}
+  2. SQLite runtime_meta[secrets]: cloudflare.{api_token, account_id, otp_kv_namespace_id}
 
 启用方式：设环境变量 OTP_BACKEND=cf_kv 即可让
 mail_provider.wait_for_otp / card.py:_fetch_openai_login_otp 走这条路。
@@ -21,12 +21,18 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 logger = logging.getLogger(__name__)
 
@@ -66,29 +72,43 @@ class CloudflareKVOtpProvider:
         secrets_path: Optional[Path] = None,
         **kwargs,
     ) -> "CloudflareKVOtpProvider":
-        """Build from CF_* env vars; fall back to output/secrets.json."""
+        """Build from CF_* env vars; fall back to SQLite runtime_meta[secrets]."""
         token = os.getenv("CF_API_TOKEN", "").strip()
         account_id = os.getenv("CF_ACCOUNT_ID", "").strip()
         kv_id = os.getenv("CF_OTP_KV_NAMESPACE_ID", "").strip()
 
         if not (token and account_id and kv_id):
-            sp = secrets_path or Path(__file__).resolve().parent.parent / "output" / "secrets.json"
-            if sp.exists():
-                try:
-                    secrets = json.loads(sp.read_text(encoding="utf-8"))
+            try:
+                from webui.backend.db import get_db
+
+                secrets = get_db().get_runtime_json("secrets", {})
+                cf = {}
+                if isinstance(secrets, dict):
                     cf = secrets.get("cloudflare") or {}
-                    # kv_api_token 是 KV/Workers 专用 token（实践中 DNS 用的
-                    # token 跟 KV 用的常是不同 token，权限不同），优先读它，
-                    # 落回 api_token 做兼容。
-                    token = token or (
-                        cf.get("kv_api_token")
-                        or cf.get("api_token")
-                        or ""
-                    ).strip()
-                    account_id = account_id or (cf.get("account_id") or "").strip()
-                    kv_id = kv_id or (cf.get("otp_kv_namespace_id") or "").strip()
-                except Exception as e:
-                    logger.warning(f"读 {sp} 失败: {e}")
+                # kv_api_token 是 KV/Workers 专用 token（实践中 DNS 用的
+                # token 跟 KV 用的常是不同 token，权限不同），优先读它，
+                # 落回 api_token 做兼容。
+                token = token or (
+                    cf.get("kv_api_token")
+                    or cf.get("api_token")
+                    or ""
+                ).strip()
+                account_id = account_id or (cf.get("account_id") or "").strip()
+                kv_id = kv_id or (cf.get("otp_kv_namespace_id") or "").strip()
+            except Exception as e:
+                logger.warning(f"读 SQLite secrets 失败: {e}")
+
+        # 显式传入 secrets_path 时仍允许读取文件，便于离线/单文件调试；
+        # 常规 webui/pipeline 路径不再依赖 legacy secrets file。
+        if secrets_path and not (token and account_id and kv_id) and secrets_path.exists():
+            try:
+                secrets = json.loads(secrets_path.read_text(encoding="utf-8"))
+                cf = secrets.get("cloudflare") or {}
+                token = token or (cf.get("kv_api_token") or cf.get("api_token") or "").strip()
+                account_id = account_id or (cf.get("account_id") or "").strip()
+                kv_id = kv_id or (cf.get("otp_kv_namespace_id") or "").strip()
+            except Exception as e:
+                logger.warning(f"读 {secrets_path} 失败: {e}")
 
         missing = [
             name
@@ -102,7 +122,7 @@ class CloudflareKVOtpProvider:
         if missing:
             raise RuntimeError(
                 f"CloudflareKVOtpProvider 缺配置：{','.join(missing)} "
-                f"（设环境变量或写到 output/secrets.json:cloudflare.*）"
+                f"（设环境变量或写入 SQLite runtime_meta[secrets].cloudflare.*）"
             )
 
         return cls(

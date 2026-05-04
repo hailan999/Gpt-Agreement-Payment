@@ -1,12 +1,11 @@
 """Auto-setup endpoint：用户只填 API token，后端把 KV + Worker + 3 zone 的
-catch-all 路由全配好，返回写入 secrets.json 所需的字段。
+catch-all 路由全配好，返回写入 SQLite secrets 所需的字段。
 
 复用 scripts/setup_cf_email_worker.py 的 CFClient（已重构成抛 CFError 而
 非 SystemExit），不再要求用户跑 CLI 脚本。
 """
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -15,7 +14,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from ..auth import CurrentUser
-from .. import settings as s
+from ..db import get_db
 
 # 把 scripts/ 加到 sys.path 以便 import setup_cf_email_worker
 _SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "scripts"
@@ -60,7 +59,7 @@ def _short_actions(actions: list) -> str:
 
 @router.post("/auto-setup", response_model=AutoSetupResult)
 def auto_setup(body: AutoSetupInput, user: str = CurrentUser):
-    """一键部署：建 KV → 上传 Worker → 给每 zone 切 catch-all → 落 secrets.json。"""
+    """一键部署：建 KV → 上传 Worker → 给每 zone 切 catch-all → 落 SQLite secrets。"""
     if not WORKER_JS.exists():
         raise HTTPException(status_code=500, detail=f"找不到 Worker 脚本: {WORKER_JS}")
 
@@ -126,14 +125,11 @@ def auto_setup(body: AutoSetupInput, user: str = CurrentUser):
         except CFError as e:
             zones_results.append(ZoneResult(zone=zone, ok=False, error=str(e)))
 
-    # ── 写 secrets.json（增量合并）
-    secrets_path = s.get_data_dir() / "secrets.json"
-    existing: dict = {}
-    if secrets_path.exists():
-        try:
-            existing = json.loads(secrets_path.read_text(encoding="utf-8"))
-        except Exception:
-            existing = {}
+    # ── 写 SQLite secrets（增量合并）
+    db = get_db()
+    existing = db.get_runtime_json("secrets", {})
+    if not isinstance(existing, dict):
+        existing = {}
     cf_section = existing.setdefault("cloudflare", {})
     cf_section["api_token"] = body.api_token
     cf_section["account_id"] = account_id
@@ -143,11 +139,8 @@ def auto_setup(body: AutoSetupInput, user: str = CurrentUser):
         cf_section["zone_names"] = list(body.zones)
     if body.fallback_to:
         cf_section["forward_to"] = body.fallback_to
-    secrets_path.parent.mkdir(parents=True, exist_ok=True)
-    secrets_path.write_text(
-        json.dumps(existing, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    db.set_runtime_json("secrets", existing)
+    secrets_path = "sqlite:runtime_meta/secrets"
 
     return AutoSetupResult(
         account_id=account_id,
@@ -155,5 +148,5 @@ def auto_setup(body: AutoSetupInput, user: str = CurrentUser):
         kv_namespace_id=kv_id,
         worker_name=body.worker_name,
         zones_configured=zones_results,
-        secrets_path=str(secrets_path),
+        secrets_path=secrets_path,
     )

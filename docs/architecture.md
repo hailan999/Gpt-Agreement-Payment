@@ -12,7 +12,7 @@ flowchart LR
     D --> E[Camoufox PayPal<br/>协议授权]
     E --> F[Stripe poll<br/>state=succeeded]
     F --> G[Camoufox 二次登录<br/>Codex OAuth + PKCE]
-    G --> H[refresh_token<br/>output/results.jsonl]
+    G --> H[refresh_token<br/>output/webui.db &#40;SQLite&#41;]
     H --> I[可选: 推 gpt-team /<br/>CPA / 其他下游]
 ```
 
@@ -40,9 +40,8 @@ Gpt-Agreement-Payment/
 │   └── config.py                   # dataclass 配置定义
 ├── docs/                           # 详细文档
 └── output/                         # 运行时产物（gitignored）
-    ├── results.jsonl
-    ├── registered_accounts.jsonl
-    ├── daemon_state.json
+    ├── webui.db                  # SQLite runtime store
+    ├── SQLite runtime_meta[daemon_state]
     └── logs/
 ```
 
@@ -187,29 +186,18 @@ WebshareQuotaExhausted      # Webshare 替换代理配额耗尽
 
 ## 数据流
 
-### `output/results.jsonl`
+### `output/webui.db`
 
-每条 pipeline 结果一行 JSON：
+运行时账号 / 支付 / OAuth 状态都存放在 SQLite 数据库 `output/webui.db` 中。主要表包括：
 
-```json
-{"ts": "2026-04-27T03:14:22Z",
- "status": "succeeded",
- "chatgpt_email": "abc123@your-domain.example",
- "session_id": "cs_live_a1b2c3...",
- "channel": "paypal",
- "team_account_id": "38a7aff4-...-...",
- "refresh_token": "rt_...",
- "invite_permission": "ok",
- "team_gpt_account_pk": 12345,
- "email_domain": "your-domain.example",
- "cpa_import": {"status": "ok", "account_id": "..."}}
-```
+- `registered_accounts`：注册成功账号的完整凭证（`password` / `access_token` / `session_token` / `device_id` / cookies 等）
+- `pipeline_results`：pipeline 单次 / 批量 / self-dealer 的结果摘要
+- `card_results`：`card.py` 的支付终态和补字段结果
+- `oauth_status`：free-only / RT 维护时的 OAuth 状态机
 
-### `output/registered_accounts.jsonl`
+> 这部分是运行时数据，不再使用 JSONL 作为主存储。
 
-每个注册成功的账号一行 JSON，包含完整凭证（`password` / `access_token` / `session_token` / `device_id` / cookies）。**这个文件含敏感数据**，gitignore 已经排除。
-
-### `output/daemon_state.json`
+### `SQLite runtime_meta[daemon_state]`
 
 daemon 模式的状态快照（重启续跑用）：
 

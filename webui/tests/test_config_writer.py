@@ -2,6 +2,8 @@ import json
 import importlib.util
 from pathlib import Path
 
+from webui.backend.db import get_db
+
 
 def _login(client):
     client.post("/api/setup", json={"username": "admin", "password": "hunter2hunter2"})
@@ -21,8 +23,7 @@ def _seed(tmp_path, monkeypatch):
     monkeypatch.setattr(s, "REG_EXAMPLE_PATH", reg_ex)
     monkeypatch.setattr(s, "PAY_CONFIG_PATH", tmp_path / "CTF-pay" / "config.paypal.json")
     monkeypatch.setattr(s, "REG_CONFIG_PATH", tmp_path / "CTF-reg" / "config.paypal-proxy.json")
-    # 注：conftest 已经把 WEBUI_DATA_DIR 设到 tmp_path，secrets.json 会落
-    # 到 tmp_path/secrets.json，下面断言要用这个路径。
+    # 注：conftest 已经把 WEBUI_DATA_DIR 设到 tmp_path，SQLite 会落到 tmp_path/webui.db。
 
 
 def test_export_writes_two_files(client, tmp_path, monkeypatch):
@@ -54,9 +55,10 @@ def test_export_writes_two_files(client, tmp_path, monkeypatch):
     assert "imap_server" not in reg["mail"]
     assert reg["captcha"]["client_key"] == "k"
 
-    # secrets.json 应该带上 cloudflare 凭证（落在 conftest 设的 WEBUI_DATA_DIR）
-    secrets = json.loads((tmp_path / "secrets.json").read_text())
+    # Cloudflare 凭证应写入 SQLite runtime_meta[secrets]，不再落 secrets.json。
+    secrets = get_db().get_runtime_json("secrets", {})
     cf = secrets["cloudflare"]
+    assert not (tmp_path / "secrets.json").exists()
     assert cf["api_token"] == "tok-abc"
     assert cf["zone_names"] == ["a.com", "b.com"]
     assert cf["account_id"] == "acct-123"
@@ -98,8 +100,9 @@ def test_export_writes_gopay_auto_otp(client, tmp_path, monkeypatch):
     pay = json.loads((tmp_path / "CTF-pay" / "config.paypal.json").read_text())
     assert pay["gopay"]["country_code"] == "62"
     assert pay["gopay"]["phone_number"] == "81234567890"
-    assert pay["gopay"]["otp"]["source"] == "file"
-    assert pay["gopay"]["otp"]["path"] == str(tmp_path / "wa_otp.txt")
+    assert pay["gopay"]["otp"]["source"] == "auto"
+    assert "path" not in pay["gopay"]["otp"]
+    assert "url" not in pay["gopay"]["otp"]
     assert pay["gopay"]["otp"]["timeout"] == 240
     assert pay["gopay"]["otp"]["interval"] == 1
 

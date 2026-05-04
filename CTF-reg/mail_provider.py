@@ -13,7 +13,7 @@ OTP 提取由 Worker 端做（见 scripts/otp_email_worker.js），
   2. 委托 `CloudflareKVOtpProvider` 阻塞拿 OTP (`wait_for_otp`)
 
 KV 凭证读取顺序：环境变量 `CF_API_TOKEN/CF_ACCOUNT_ID/CF_OTP_KV_NAMESPACE_ID`
-→ output/secrets.json 的 cloudflare 段。详见 cf_kv_otp_provider.py。
+→ SQLite runtime_meta[secrets] 的 cloudflare 段。详见 cf_kv_otp_provider.py。
 """
 from __future__ import annotations
 

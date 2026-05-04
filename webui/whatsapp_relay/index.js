@@ -8,8 +8,10 @@
  *   WA_ENGINE       baileys | wwebjs  (default: baileys)
  *   WA_LOGIN_MODE   qr | pairing
  *   WA_PAIRING_PHONE  digits with country code (pairing mode only)
- *   WA_STATE_FILE   JSON state output for WebUI
- *   WA_OTP_FILE     plain OTP output for gopay.py file provider
+ *   WA_STATE_URL    WebUI internal endpoint that persists state/OTP into SQLite
+ *   WA_RELAY_TOKEN  shared token for WA_STATE_URL
+ *   WA_STATE_FILE   deprecated JSON state output (only used without WA_STATE_URL)
+ *   WA_OTP_FILE     deprecated plain OTP output (optional legacy file-provider mirror)
  *   WA_SESSION_DIR  persistent WhatsApp session directory
  *   WA_HEADLESS     "1" (default) or "0"; wwebjs only
  */
@@ -20,13 +22,17 @@ const QRCode = require("qrcode");
 const engine = (process.env.WA_ENGINE || "baileys").toLowerCase();
 const mode = (process.env.WA_LOGIN_MODE || "qr").toLowerCase();
 const pairingPhone = (process.env.WA_PAIRING_PHONE || "").replace(/\D/g, "");
-const stateFile = process.env.WA_STATE_FILE;
-const otpFile = process.env.WA_OTP_FILE;
+const stateUrl = process.env.WA_STATE_URL || "";
+const relayToken = process.env.WA_RELAY_TOKEN || "";
+const stateFile = process.env.WA_STATE_FILE || "";
+const otpFile = process.env.WA_OTP_FILE || "";
 const sessionDir = process.env.WA_SESSION_DIR || path.join(process.cwd(), ".wa-session");
 const headless = (process.env.WA_HEADLESS || "1") !== "0";
+const dbMode = !!stateUrl;
+let memoryState = {};
 
-if (!stateFile || !otpFile) {
-  console.error("WA_STATE_FILE and WA_OTP_FILE are required");
+if (!dbMode && (!stateFile || !otpFile)) {
+  console.error("WA_STATE_URL or WA_STATE_FILE+WA_OTP_FILE is required");
   process.exit(2);
 }
 
@@ -41,7 +47,22 @@ function atomicWrite(filePath, data) {
   fs.renameSync(tmp, filePath);
 }
 
+function postState(state) {
+  if (!dbMode) return;
+  fetch(stateUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-WA-Relay-Token": relayToken,
+    },
+    body: JSON.stringify(state),
+  }).catch((err) => {
+    console.error(`[state_post_error] ${err && err.message ? err.message : err}`);
+  });
+}
+
 function readState() {
+  if (dbMode) return memoryState;
   try {
     return JSON.parse(fs.readFileSync(stateFile, "utf8"));
   } catch {
@@ -55,7 +76,12 @@ function writeState(patch) {
     updated_at: Date.now() / 1000,
     ...patch,
   };
-  atomicWrite(stateFile, JSON.stringify(state, null, 2));
+  memoryState = state;
+  if (dbMode) {
+    postState(state);
+  } else {
+    atomicWrite(stateFile, JSON.stringify(state, null, 2));
+  }
   return state;
 }
 
@@ -132,7 +158,9 @@ function recordOtp(code, msg) {
     text: String(msg.body || "").slice(0, 500),
     engine,
   };
-  atomicWrite(otpFile, `${code}\n`);
+  if (otpFile) {
+    atomicWrite(otpFile, `${code}\n`);
+  }
   const state = readState();
   const history = Array.isArray(state.history) ? state.history : [];
   history.push(item);
@@ -239,7 +267,8 @@ writeState({
   engine,
   mode,
   session_dir: sessionDir,
-  otp_file: otpFile,
+  otp_file: otpFile || "",
+  otp_store: dbMode ? "sqlite" : "file",
 });
 
 async function qrToDataUrl(qr) {

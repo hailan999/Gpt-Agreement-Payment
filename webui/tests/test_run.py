@@ -99,6 +99,15 @@ def test_run_start_then_409(client, monkeypatch):
     monkeypatch.setattr(runner_mod, "_drain", lambda proc: None)
     monkeypatch.setattr(runner_mod.subprocess, "Popen", fake_popen)
 
+    # Bypass config health gate — this test focuses on the runner state
+    # machine, not config validation (covered separately in test_config_health).
+    import webui.backend.routes.run as run_route
+    monkeypatch.setattr(
+        run_route,
+        "build_config_health",
+        lambda req: {"ok": True, "blocking": [], "checks": []},
+    )
+
     # Reset module state from prior tests
     runner_mod._proc = None
     runner_mod._ended_at = None

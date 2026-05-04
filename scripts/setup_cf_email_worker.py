@@ -8,7 +8,7 @@
      绑定 OTP_KV + 可选的 FALLBACK_TO 环境变量
   4. 对每个 zone：启用 Email Routing（如未启用），把 catch-all 路由
      切到这个 Worker
-  5. 把回填到 output/secrets.json 的字段打印出来
+  5. 把回填到 SQLite runtime_meta[secrets] 的字段打印出来
 
 需要的 CF API token 权限：
   - Account → Workers Scripts:Edit
@@ -21,7 +21,7 @@
   CF_API_TOKEN=xxx CF_ACCOUNT_ID=yyy \\
     python scripts/setup_cf_email_worker.py --zones example.com,foo.com
 
-  # 或直接读 output/secrets.json 里 cloudflare.api_token + cloudflare.account_id
+  # 或直接读 SQLite runtime_meta[secrets] 里 cloudflare.api_token + cloudflare.account_id
   python scripts/setup_cf_email_worker.py --zones example.com
 
   # 加 fallback：抓到 OTP 同时转发一份到 QQ（迁移期保险）
@@ -42,9 +42,10 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
+from webui.backend.db import get_db
+
 CF = "https://api.cloudflare.com/client/v4"
 ROOT = Path(__file__).resolve().parent.parent
-SECRETS_PATH = ROOT / "output" / "secrets.json"
 WORKER_JS = Path(__file__).resolve().parent / "otp_email_worker.js"
 
 
@@ -284,12 +285,11 @@ def _short(resp: dict) -> str:
 
 
 def _load_secrets() -> dict:
-    if not SECRETS_PATH.exists():
-        return {}
     try:
-        return json.loads(SECRETS_PATH.read_text(encoding="utf-8"))
+        data = get_db().get_runtime_json("secrets", {})
+        return data if isinstance(data, dict) else {}
     except Exception as e:
-        print(f"[warn] 读 {SECRETS_PATH} 失败: {e}", file=sys.stderr)
+        print(f"[warn] 读 SQLite runtime_meta[secrets] 失败: {e}", file=sys.stderr)
         return {}
 
 
@@ -311,8 +311,8 @@ def main() -> None:
         default="",
         help="抓到 OTP 后同时 forward 邮件到这里（迁移期保险）",
     )
-    p.add_argument("--account-id", default="", help="覆盖环境变量 / secrets.json")
-    p.add_argument("--token", default="", help="覆盖环境变量 / secrets.json")
+    p.add_argument("--account-id", default="", help="覆盖环境变量 / SQLite runtime_meta[secrets]")
+    p.add_argument("--token", default="", help="覆盖环境变量 / SQLite runtime_meta[secrets]")
     p.add_argument(
         "--dry-run",
         action="store_true",
@@ -331,11 +331,11 @@ def main() -> None:
     )
 
     if not token:
-        sys.exit("缺 CF_API_TOKEN（或 secrets.json 的 cloudflare.api_token）")
+        sys.exit("缺 CF_API_TOKEN（或 SQLite runtime_meta[secrets] 的 cloudflare.api_token）")
     if not account_id:
         sys.exit(
             "缺 CF_ACCOUNT_ID。Cloudflare dashboard 右下角能看到 Account ID，"
-            "传 --account-id 或 CF_ACCOUNT_ID 或写进 secrets.json"
+            "传 --account-id 或 CF_ACCOUNT_ID 或写进 SQLite runtime_meta[secrets]"
         )
     if not WORKER_JS.exists():
         sys.exit(f"找不到 Worker 脚本：{WORKER_JS}")
@@ -400,7 +400,7 @@ def _run_setup_cli(client: "CFClient", account_id: str, args) -> None:
         client.set_catch_all_to_worker(zid, args.worker_name)
         print(f"      [{zname}] after:  worker='{args.worker_name}' ✓")
 
-    print("\n=== Done. 把这两个字段加到 output/secrets.json: ===")
+    print("\n=== Done. 把这两个字段加到 SQLite runtime_meta[secrets]: ===")
     suggestion = {
         "cloudflare": {
             "api_token": "(已有, 不变)",

@@ -15,7 +15,7 @@ class MailConfig:
     字段（imap_server/imap_port/smtp_*/email/auth_code）已彻底废弃；旧
     config 文件里残留这些字段会被 Config.from_file 静默忽略。
 
-    KV 凭证（api_token / account_id / kv_namespace_id）放 output/secrets.json
+    KV 凭证（api_token / account_id / kv_namespace_id）放 SQLite runtime_meta[secrets]
     的 cloudflare 段或环境变量，不在 MailConfig 里。
     """
     catch_all_domain: str = ""
