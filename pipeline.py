@@ -1045,6 +1045,8 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
     is_pay_only = bool(kwargs.pop("pay_only", False))
     use_gopay = bool(kwargs.pop("use_gopay", False))
     gopay_otp_file = kwargs.pop("gopay_otp_file", "")
+    kwargs["use_gopay"] = use_gopay
+    kwargs["gopay_otp_file"] = gopay_otp_file
 
     # 构造共享 pool + team_client（所有 worker 复用）
     card_cfg = _read_card_cfg(card_config_path)
@@ -2776,6 +2778,85 @@ def _find_team_id_from_results(email: str) -> str:
     return ""
 
 
+def _env_truthy(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _cfg_truthy(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _gopay_unlink_after_cpa_json(email: str, cpa_cfg: dict) -> None:
+    """CPA 本地 JSON 落盘后，best-effort 触发 GoPay Linked apps 解绑。"""
+    unlink_cfg = cpa_cfg.get("gopay_unlink") or {}
+    enabled = _cfg_truthy(unlink_cfg.get("enabled")) or _env_truthy("GOPAY_ADB_UNLINK")
+    if not enabled:
+        return
+
+    adb_path = (
+        unlink_cfg.get("adb_path")
+        or os.environ.get("GOPAY_ADB_PATH")
+        or "adb"
+    )
+    device = (
+        unlink_cfg.get("device")
+        or os.environ.get("GOPAY_ADB_DEVICE")
+        or "emulator-5554"
+    )
+    flow = (
+        unlink_cfg.get("flow")
+        or os.environ.get("GOPAY_ADB_FLOW")
+        or "unlink_first_app_from_account_settings"
+    )
+    config_path = (
+        unlink_cfg.get("config")
+        or os.environ.get("GOPAY_ADB_CONFIG")
+        or str(ROOT / "scripts" / "gopay_adb_coords.example.json")
+    )
+    timeout_s = int(unlink_cfg.get("timeout_s") or os.environ.get("GOPAY_ADB_TIMEOUT_S") or 20)
+    set_ratios = unlink_cfg.get("set_ratios") or {
+        "first_linked_app_unlink": "0.75,0.19",
+        "confirm_unlink": "0.52,0.88",
+    }
+
+    cmd = [
+        sys.executable,
+        str(ROOT / "scripts" / "gopay_adb_unlink.py"),
+        "--adb",
+        str(adb_path),
+        "--device",
+        str(device),
+        "--config",
+        str(config_path),
+    ]
+    if isinstance(set_ratios, dict):
+        for name, value in set_ratios.items():
+            cmd.extend(["--set-ratio", f"{name}={value}"])
+    cmd.extend(["run-flow", flow, "--execute", "--allow-unlink", "--yes"])
+
+    print(f"[GoPay unlink] {email} CPA JSON 已保存，开始解绑 Linked apps")
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            timeout=timeout_s,
+        )
+    except Exception as e:
+        print(f"[GoPay unlink] {email} 启动失败: {e}")
+        return
+    if proc.stdout.strip():
+        print(proc.stdout.strip())
+    if proc.returncode == 0:
+        print(f"[GoPay unlink] ✓ {email} 已执行解绑流程")
+    else:
+        err = (proc.stderr or proc.stdout or "").strip()
+        print(f"[GoPay unlink] ✗ {email} 解绑流程失败 rc={proc.returncode} {err[:500]}")
+
+
 def _cpa_import_after_team(
     email: str,
     sid: str,
@@ -2843,6 +2924,7 @@ def _cpa_import_after_team(
         print(f"[CPA] {email} 无 refresh_token，回退使用现有 access_token 裸导入")
         token_path = _save_local_codex_json(email, body, plan_tag)
         print(f"[CPA] {email} 本地 JSON 已保存: {token_path}")
+        _gopay_unlink_after_cpa_json(email, cpa_cfg)
         if local_only:
             return "local_saved"
         tag = hashlib.md5(email.encode()).hexdigest()[:8]
@@ -2937,6 +3019,7 @@ def _cpa_import_after_team(
         if existing:
             token_path = _save_local_codex_json(email, existing, plan_tag)
             print(f"[CPA] {email} 复用已有本地 JSON: {token_path}")
+            _gopay_unlink_after_cpa_json(email, cpa_cfg)
             return "local_saved"
         print(f"[CPA] {email} 未拿到 access_token，跳过本地 JSON 覆盖")
         return "no_json"
@@ -2960,6 +3043,7 @@ def _cpa_import_after_team(
     }
     token_path = _save_local_codex_json(email, body, plan_tag)
     print(f"[CPA] {email} 本地 JSON 已保存: {token_path}")
+    _gopay_unlink_after_cpa_json(email, cpa_cfg)
     if local_only:
         return "local_saved"
     tag = hashlib.md5(email.encode()).hexdigest()[:8]

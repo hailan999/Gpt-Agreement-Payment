@@ -1,0 +1,111 @@
+{
+  "adb_path": "adb",
+  "device": "",
+  "screenshot_dir": "output/gopay_adb_screenshots",
+  "default_wait_seconds": 1.2,
+  "coords": {
+    "profile_tab": {
+      "ratio": [0.9, 0.95],
+      "description": "Bottom navigation Profile tab"
+    },
+    "account_app_settings": {
+      "ratio": [0.54, 0.89],
+      "description": "Profile page Account & app settings row"
+    },
+    "linked_apps": {
+      "ratio": [0.43, 0.59],
+      "description": "Account & app settings page Linked apps row"
+    },
+    "first_linked_app": {
+      "ratio": [0.5, 0.24],
+      "description": "First app row on the Linked apps list"
+    },
+    "first_linked_app_unlink": {
+      "ratio": [0.75, 0.19],
+      "description": "Unlink button for the first app row on the Linked apps list"
+    },
+    "unlink_button": {
+      "ratio": [0.5, 0.89],
+      "description": "Unlink or Disconnect button on an app detail page"
+    },
+    "confirm_unlink": {
+      "ratio": [0.52, 0.88],
+      "description": "Confirm button in the unlink confirmation dialog"
+    }
+  },
+  "flows": {
+    "open_linked_apps_from_profile": [
+      {"screenshot": "01_profile_before"},
+      {"tap": "account_app_settings"},
+      {"wait": 1.5},
+      {"screenshot": "02_account_settings"},
+      {"tap": "linked_apps"},
+      {"wait": 2.0},
+      {"screenshot": "03_linked_apps"}
+    ],
+    "unlink_first_app_from_profile": [
+      {"screenshot": "01_profile_before"},
+      {"tap": "account_app_settings"},
+      {"wait": 1.5},
+      {"screenshot": "02_account_settings"},
+      {"tap": "linked_apps"},
+      {"wait": 2.0},
+      {"screenshot": "03_linked_apps_before_unlink"},
+      {"tap": "first_linked_app_unlink"},
+      {"wait": 1.5},
+      {"screenshot": "04_unlink_confirm_dialog"},
+      {"tap": "confirm_unlink"},
+      {"wait": 2.0},
+      {"screenshot": "05_after_unlink"},
+      {"back": true},
+      {"wait": 1.0},
+      {"screenshot": "06_account_settings_after_back"}
+    ],
+    "open_linked_apps_from_account_settings": [
+      {"screenshot": "01_account_settings_before"},
+      {"tap": "linked_apps"},
+      {"wait": 2.0},
+      {"screenshot": "02_linked_apps"}
+    ],
+    "unlink_first_app_from_account_settings": [
+      {"screenshot": "01_account_settings_before"},
+      {"tap": "linked_apps"},
+      {"wait": 2.0},
+      {"screenshot": "02_linked_apps_before_unlink"},
+      {"tap": "first_linked_app_unlink"},
+      {"wait": 1.5},
+      {"screenshot": "03_unlink_confirm_dialog"},
+      {"tap": "confirm_unlink"},
+      {"wait": 2.0},
+      {"screenshot": "04_after_unlink"},
+      {"back": true},
+      {"wait": 1.0},
+      {"screenshot": "05_account_settings_after_back"}
+    ],
+    "unlink_first_app_from_list": [
+      {"screenshot": "01_linked_apps_before_unlink"},
+      {"pause": "Confirm the first app row is the app you want to unlink, then press Enter."},
+      {"tap": "first_linked_app_unlink"},
+      {"wait": 1.5},
+      {"screenshot": "02_unlink_confirm_dialog"},
+      {"pause": "If this is a normal confirmation dialog, press Enter to confirm. If GoPay asks for PIN, OTP, captcha, or extra verification, complete it manually or stop this script."},
+      {"tap": "confirm_unlink"},
+      {"wait": 2.0},
+      {"screenshot": "03_after_unlink"},
+      {"back": true},
+      {"wait": 1.0},
+      {"screenshot": "04_account_settings_after_back"}
+    ],
+    "unlink_current_app": [
+      {"screenshot": "01_app_detail_before_unlink"},
+      {"pause": "Confirm the current page is the app you want to unlink, then press Enter."},
+      {"tap": "unlink_button"},
+      {"wait": 1.5},
+      {"screenshot": "02_unlink_confirm_dialog"},
+      {"pause": "If this is a normal confirmation dialog, press Enter to confirm. If GoPay asks for PIN, OTP, captcha, or extra verification, complete it manually or stop this script."},
+      {"tap": "confirm_unlink"},
+      {"wait": 2.0},
+      {"screenshot": "03_after_unlink"}
+    ]
+  }
+}

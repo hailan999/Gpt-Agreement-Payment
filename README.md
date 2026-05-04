@@ -65,6 +65,40 @@ flowchart LR
 
 ## 上手
 
+### GoPay 解绑自动化（ADB）
+
+用于在雷电模拟器里从 GoPay 的 `Account & app settings` 页面自动进入
+`Linked apps`，点击第一条绑定应用右侧的 `Unlink`，点击确认弹窗底部的
+绿色 `Unlink` 按钮，然后返回 `Account & app settings`。
+
+```powershell
+python scripts/gopay_adb_unlink.py --adb "E:\leidian\LDPlayer9\adb.exe" --device emulator-5554 --set-ratio first_linked_app_unlink=0.75,0.19 --set-ratio confirm_unlink=0.52,0.88 run-flow unlink_first_app_from_account_settings --execute --allow-unlink --yes
+```
+
+运行前请确认雷电模拟器已开启 ADB，设备号是 `emulator-5554`，并且当前 GoPay
+页面停在 `Account & app settings`。如果你的雷电安装路径或设备号不同，替换
+`--adb` 和 `--device` 的值。
+
+pipeline 集成点在 `[CPA] ... 本地 JSON 已保存` 之后。要让 pipeline 自动执行
+同一套解绑流程，可在支付配置的 `cpa` 下加入：
+
+```json
+"gopay_unlink": {
+  "enabled": true,
+  "adb_path": "E:\\leidian\\LDPlayer9\\adb.exe",
+  "device": "emulator-5554",
+  "flow": "unlink_first_app_from_account_settings"
+}
+```
+
+也可以不改配置，临时用环境变量打开：
+
+```powershell
+$env:GOPAY_ADB_UNLINK="1"
+$env:GOPAY_ADB_PATH="E:\leidian\LDPlayer9\adb.exe"
+$env:GOPAY_ADB_DEVICE="emulator-5554"
+```
+
 ### 新手路径：webui 配置向导（推荐）
 
 把 1–3 小时的手动调配压到 ~15 分钟。14 步 wizard + 实时 preflight 自检 + 内置运行控制器（SSE 日志流），生成 `CTF-pay/config.auto.json` + `CTF-reg/config.paypal-proxy.json` 两份配置。

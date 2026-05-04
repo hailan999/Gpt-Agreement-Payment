@@ -126,6 +126,35 @@ def test_pay_only_success_imports_cpa_with_plus_tag(tmp_path, monkeypatch):
     assert rows[-1]["cpa_import"] == "ok"
 
 
+def test_batch_full_pipeline_preserves_gopay_flag(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(pipeline, "_read_card_cfg", lambda path: {})
+    monkeypatch.setattr(pipeline, "_load_cardw_path_from_card_cfg", lambda cfg, path: "cardw.json")
+    monkeypatch.setattr(
+        pipeline,
+        "_build_domain_pool_from_cardw",
+        lambda *args, **kwargs: types.SimpleNamespace(domains=[], provisioner=None),
+    )
+    monkeypatch.setattr(pipeline, "_build_team_client_from_card_cfg", lambda cfg: None)
+    monkeypatch.setattr(pipeline, "_build_proxy_pool_from_card_cfg", lambda cfg: types.SimpleNamespace(proxies=[]))
+
+    def fake_pipeline(card_config_path, **kwargs):
+        calls.append(kwargs)
+        return {
+            "registration": {"email": "ok@example.com"},
+            "payment": {"status": "succeeded", "email": "ok@example.com"},
+        }
+
+    monkeypatch.setattr(pipeline, "pipeline", fake_pipeline)
+
+    pipeline.batch("config.json", 1, delay=0, workers=1, use_gopay=True, gopay_otp_file="otp.txt")
+
+    assert calls
+    assert calls[0]["use_gopay"] is True
+    assert calls[0]["gopay_otp_file"] == "otp.txt"
+
+
 def test_cpa_import_falls_back_to_access_token_without_refresh_token(tmp_path, monkeypatch):
     db = _reset_db(tmp_path, monkeypatch)
     db.add_registered_account({

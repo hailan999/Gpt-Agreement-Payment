@@ -646,6 +646,8 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
                     "invalid_state",
                     "failed to create account. please try again.",
                     "passwordless 发码失败",
+                    "browser-reg-retryable",
+                    "注册流程进入异常 auth 页面",
                 )
             )
             if attempt < max_register_attempts and retryable:

@@ -93,6 +93,73 @@ def _goto_with_retry(page, url: str, *, wait_until: str = "domcontentloaded", ti
         raise last_error
 
 
+def _is_register_restart_url(url: str) -> bool:
+    """这些 auth 页面表示注册挑战态已经跑偏，本轮继续点按钮只会空转。"""
+    try:
+        parsed = urlparse(url or "")
+    except Exception:
+        return False
+    if parsed.netloc != "auth.openai.com":
+        return False
+    if parsed.path == "/email-verification/register":
+        return True
+    return parsed.path == "/api/accounts/authorize"
+
+
+def _is_authorize_interstitial_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url or "")
+    except Exception:
+        return False
+    return parsed.netloc == "auth.openai.com" and parsed.path == "/api/accounts/authorize"
+
+
+def _wait_out_authorize_interstitial(page, stage: str, timeout_s: int = 25) -> bool:
+    """等待 auth.openai.com/api/accounts/authorize 中转落到下一页。"""
+    if not _is_authorize_interstitial_url(page.url):
+        return False
+    logger.info(
+        f"[browser-reg] {stage}: 等待 authorize 中转落地，当前 URL: {page.url[:120]}"
+    )
+    deadline = time.time() + max(1, timeout_s)
+    last_log = 0.0
+    while time.time() < deadline:
+        cur = page.url
+        if not _is_authorize_interstitial_url(cur):
+            logger.info(f"[browser-reg] {stage}: authorize 中转已离开 -> {cur[:120]}")
+            return True
+        if page.query_selector('input[autocomplete="one-time-code"]') or \
+           page.query_selector('input[name="code"]') or \
+           page.query_selector('input[inputmode="numeric"]') or \
+           page.query_selector('input[type="password"], input[name="password"]'):
+            logger.info(f"[browser-reg] {stage}: authorize 中转页已出现可继续输入框")
+            return True
+        now = time.time()
+        if now - last_log >= 5:
+            logger.info(f"[browser-reg] {stage}: authorize 中转等待中: {cur[:100]}")
+            last_log = now
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=1000)
+        except Exception:
+            time.sleep(1)
+    return False
+
+
+def _abort_on_register_restart_url(page, stage: str):
+    cur = page.url
+    if not _is_register_restart_url(cur):
+        return
+    safe_stage = re.sub(r"[^a-zA-Z0-9_]+", "_", stage).strip("_") or "unknown"
+    try:
+        page.screenshot(path=f"/tmp/browser_reg_restart_{safe_stage}.png")
+    except Exception:
+        pass
+    raise RuntimeError(
+        "[browser-reg-retryable] 注册流程进入异常 auth 页面，"
+        f"本轮需要从头重试: stage={stage} url={cur[:180]}"
+    )
+
+
 def _parse_proxy(proxy_url: str):
     """Camoufox 需要 socks5 + 无 auth 的格式。socks5 + auth 需要走 gost 中继。"""
     if not proxy_url:
@@ -261,14 +328,20 @@ def browser_register(cfg, mail_provider) -> dict:
             time.sleep(random.uniform(0.5, 1.2))
             # Continue
             otp_accept_from = time.time() - 5
+            clicked_email_continue = False
             for sel in ['button[type="submit"]', 'button:has-text("Continue")',
                         'button:has-text("Next")']:
                 b = page.query_selector(sel)
                 if b and b.is_visible():
                     b.click()
+                    clicked_email_continue = True
                     logger.info(f"[browser-reg] 点击 email 继续: {sel}")
                     break
+            if not clicked_email_continue:
+                page.screenshot(path="/tmp/browser_reg_email_continue_missing.png")
+                raise RuntimeError(f"email 继续按钮未找到，当前 URL={page.url[:120]}")
             time.sleep(3)
+            _wait_out_authorize_interstitial(page, "email_continue", timeout_s=25)
 
             # [3] 填密码（新账号会看到密码框）
             logger.info("[browser-reg] 等待密码框 ...")
@@ -294,13 +367,16 @@ def browser_register(cfg, mail_provider) -> dict:
                 logger.warning(f"[browser-reg] 密码框异常: {e}，可能走无密码 OTP 路径")
 
             time.sleep(3)
+            _wait_out_authorize_interstitial(page, "after_password", timeout_s=25)
             logger.info(f"[browser-reg] 密码后 URL: {page.url[:120]}")
+            _abort_on_register_restart_url(page, "after_password")
 
             # [4] Turnstile / hCaptcha 等待（Camoufox 指纹通常可自动通过）
             logger.info("[browser-reg] 等待反欺诈检查 ...")
             for wait_i in range(30):
                 time.sleep(1)
                 cur = page.url
+                _abort_on_register_restart_url(page, f"antifraud_wait_{wait_i}s")
                 # 到达 OTP 输入或继续步骤 → 通过
                 if page.query_selector('input[autocomplete="one-time-code"]') or \
                    page.query_selector('input[name="code"]') or \
@@ -358,6 +434,7 @@ def browser_register(cfg, mail_provider) -> dict:
                         logger.info(f"[browser-reg] 点击 OTP 继续: {sel}")
                         break
                 time.sleep(4)
+                _abort_on_register_restart_url(page, "after_otp_submit")
 
                 # OpenAI 在 OTP 错误时会显示 "Incorrect code" 红字，反复点
                 # Continue 会触发 max_check_attempts 风控（永久卡死）。早退。
@@ -377,12 +454,15 @@ def browser_register(cfg, mail_provider) -> dict:
 
             # [6] /about-you：Full name + Age（单框）
             logger.info(f"[browser-reg] OTP 后 URL: {page.url[:120]}")
+            _abort_on_register_restart_url(page, "post_otp_url")
             time.sleep(5)  # 等重定向到 /about-you
             logger.info(f"[browser-reg] 稳定后 URL: {page.url[:120]}")
+            _abort_on_register_restart_url(page, "post_otp_stable_url")
 
             # 等 /about-you 表单加载完成。先等 URL 稳定
             for _ in range(20):
                 time.sleep(1)
+                _abort_on_register_restart_url(page, "waiting_about_you")
                 if "about-you" in page.url or "chatgpt.com" in page.url:
                     break
 
@@ -528,6 +608,7 @@ def browser_register(cfg, mail_provider) -> dict:
                 if cur != last_url:
                     logger.info(f"[browser-reg] URL@{i}s: {cur[:120]}")
                     last_url = cur
+                _abort_on_register_restart_url(page, f"waiting_chatgpt_{i}s")
                 # 到 chatgpt.com 且已加载 React 主界面
                 if "chatgpt.com" in cur and "auth.openai.com" not in cur:
                     # 等 /api/auth/session 能正常返回 accessToken 才算完成

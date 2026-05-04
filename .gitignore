@@ -20,6 +20,7 @@ webui/whatsapp_relay/baileys-gopay/
 
 # 运行时产物（账号凭证 / 支付结果 / 日志 / 域池状态 / CF API token）
 output/
+scripts/gopay_adb_coords.json
 
 # 用户实际配置（保留 *.example.json，忽略实际填写过的）
 CTF-pay/config.paypal.json
