@@ -220,6 +220,7 @@ class CloudflareKVOtpProvider:
         start = time.time()
         polls = 0
         last_log_at = 0.0
+        stale_deleted = False
         logger.info(
             f"[CF-KV] 等 OTP key={key} timeout={timeout}s "
             f"(issued_after={issued_after:.0f})"
@@ -239,11 +240,18 @@ class CloudflareKVOtpProvider:
                 # ts 太老（fallback、上一次 run 残留）→ 忽略，继续轮
                 if ts_s and ts_s < accept_threshold_s:
                     if time.time() - last_log_at > 10:
+                        subject = str(payload.get("subject") or "")[:80]
                         logger.info(
                             f"[CF-KV] key={key} 命中但 ts={ts_s:.0f} < "
-                            f"threshold={accept_threshold_s:.0f}，忽略旧值"
+                            f"threshold={accept_threshold_s:.0f}，忽略旧值 "
+                            f"from={payload.get('from','?')[:60]!r} "
+                            f"subject={subject!r}"
                         )
                         last_log_at = time.time()
+                    if self.delete_after_read and not stale_deleted:
+                        self._kv_delete(key)
+                        stale_deleted = True
+                        logger.info(f"[CF-KV] 已删除旧 OTP key={key}，继续等新邮件")
                 else:
                     otp = str(payload["otp"]).strip()
                     elapsed = time.time() - start

@@ -561,7 +561,7 @@ class RegistrationError(RuntimeError):
     pass
 
 
-def register(cardw_config_path, proxy=None, python="python3", timeout=600, browser: bool = True):
+def register(cardw_config_path, proxy=None, python=None, timeout=600, browser: bool = True):
     """注册一个新 ChatGPT 账号。
 
     browser=True 时走 Camoufox 真浏览器注册流程（Turnstile 真实执行，避免账号被风控）。
@@ -614,6 +614,7 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
 
         pass
 
+    python = python or sys.executable
     cmd = [python, "-c", script, auth_bundle_dir, cardw_config_path]
     print(f"[register] 注册新账号 (config={os.path.basename(cardw_config_path)}) ...")
 
@@ -729,7 +730,7 @@ def _cpa_cfg_for_card_payment(card_cfg: dict) -> dict:
 
 def pay(card_config_path, session_token=None, access_token=None,
         device_id=None, use_paypal=False, use_gopay=False,
-        gopay_otp_file=None, python="python3", timeout=600):
+        gopay_otp_file=None, python=None, timeout=600):
     """执行 Stripe 支付流程。
 
     use_paypal / use_gopay 互斥：默认 card 路径，paypal 走 PayPal browser，
@@ -767,7 +768,7 @@ def pay(card_config_path, session_token=None, access_token=None,
 
         tmp_config = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", prefix="pipeline_pay_",
-            dir=str(CARD_DIR), delete=False,
+            dir=str(CARD_DIR), delete=False, encoding="utf-8",
         )
         json.dump(cfg, tmp_config, ensure_ascii=False, indent=2)
         tmp_config.close()
@@ -779,6 +780,7 @@ def pay(card_config_path, session_token=None, access_token=None,
         except Exception:
             cfg_for_env = {}
 
+    python = python or sys.executable
     cmd = [python, str(CARD_PY), "auto",
            "--config", config_to_use, "--json-result"]
     if use_paypal:
@@ -2504,7 +2506,7 @@ def _rewrite_cardw_with_domain(src_path, domain, proxy_url=""):
         data["proxy"] = proxy_url
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", prefix="pipeline_cardw_",
-        dir=str(CARDW_DIR), delete=False,
+        dir=str(CARDW_DIR), delete=False, encoding="utf-8",
     )
     json.dump(data, tmp, ensure_ascii=False, indent=2)
     tmp.close()
@@ -2518,7 +2520,7 @@ def _rewrite_card_with_proxy(src_path, proxy_url):
     data["proxy"] = proxy_url
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", prefix="pipeline_pay_px_",
-        dir=str(CARD_DIR), delete=False,
+        dir=str(CARD_DIR), delete=False, encoding="utf-8",
     )
     json.dump(data, tmp, ensure_ascii=False, indent=2)
     tmp.close()
@@ -3401,7 +3403,7 @@ def main():
         elif args.register_only:
             cardw_cfg = args.cardw_config
             if not cardw_cfg:
-                with open(args.config) as f:
+                with open(args.config, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
                 cardw_cfg = cfg.get("fresh_checkout", {}).get("auth", {}).get(
                     "auto_register", {}).get("config_path", "CTF-reg/config.noproxy.json")
