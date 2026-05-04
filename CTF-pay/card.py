@@ -32,8 +32,23 @@ import time
 import urllib.parse
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
+
+
+def _configure_console_encoding() -> None:
+    """Keep console output from crashing under UTF-8 or legacy GBK shells."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
+_configure_console_encoding()
 
 import requests
 _REPO_DIR_BOOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -41,9 +56,11 @@ if _REPO_DIR_BOOT not in sys.path:
     sys.path.insert(0, _REPO_DIR_BOOT)
 from webui.backend.db import get_db
 try:
+    from curl_cffi import requests as curl_requests
     from curl_cffi.requests import Session as CurlCffiSession
     _HAS_CURL_CFFI = True
 except Exception:
+    curl_requests = None
     CurlCffiSession = None
     _HAS_CURL_CFFI = False
 
@@ -51,6 +68,9 @@ except Exception:
 _OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
 os.makedirs(os.path.join(_OUTPUT_DIR, "logs"), exist_ok=True)
 LOG_FILE = os.path.join(_OUTPUT_DIR, "logs", "card.log")
+_LAST_CODEX_TOKEN_BUNDLE: dict = {}
+_LAST_CODEX_CALLBACK: dict = {}
+_OAUTH_CODE_PREFIX = "oauth_code:"
 
 # 让 `from cf_kv_otp_provider import ...` 在 card.py 直接执行/被 pipeline 子进程
 # 拉起时都能命中 `CTF-reg/` 下的实现。否则 RT / PayPal OTP 会在
@@ -494,6 +514,7 @@ def _provision_openai_auth_via_local_bundle(cfg: dict, fresh_cfg: dict) -> dict:
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     default_env_overrides = {
         "OAUTH_CODEX_RT_BEFORE_CALLBACK": "0",
         "OAUTH_CODEX_RT_EXCHANGE": "0",
@@ -587,6 +608,8 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
             )
 
@@ -3967,6 +3990,7 @@ def solve_stripe_hcaptcha_in_browser(
                     solver_cmd.extend(str(x) for x in extra_args if x not in (None, ""))
 
                 solver_env = os.environ.copy()
+                solver_env.setdefault("PYTHONIOENCODING", "utf-8")
                 solver_tmpdir = str(external_solver_cfg.get("tmpdir") or "").strip()
                 if solver_tmpdir:
                     solver_env["TMPDIR"] = solver_tmpdir
@@ -4014,6 +4038,8 @@ def solve_stripe_hcaptcha_in_browser(
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
                         text=True,
+                        encoding="utf-8",
+                        errors="replace",
                         bufsize=1,
                         cwd=os.path.dirname(solver_script) or None,
                         env=solver_env,
@@ -5053,7 +5079,147 @@ def _safe_screenshot(page, path: str):
         pass
 
 
-def _fetch_openai_login_otp(target_email: str, timeout: int = 180) -> str:
+def _save_refresh_token_json(
+    email: str,
+    refresh_token: str,
+    *,
+    token_bundle: dict | None = None,
+    session_id: str = "",
+    payment_channel: str = "",
+    team_account_id: str = "",
+) -> str:
+    token_bundle = token_bundle if isinstance(token_bundle, dict) else {}
+    access_token = token_bundle.get("access_token", "") or ""
+    id_token = token_bundle.get("id_token", "") or ""
+    refresh_token = token_bundle.get("refresh_token", "") or refresh_token or ""
+
+    access_payload = _decode_jwt_payload(access_token)
+    id_payload = _decode_jwt_payload(id_token)
+    auth_claim = access_payload.get("https://api.openai.com/auth", {})
+    if not isinstance(auth_claim, dict):
+        auth_claim = {}
+    id_auth_claim = id_payload.get("https://api.openai.com/auth", {})
+    if not isinstance(id_auth_claim, dict):
+        id_auth_claim = {}
+
+    profile = access_payload.get("https://api.openai.com/profile", {})
+    if not isinstance(profile, dict):
+        profile = {}
+    resolved_email = (
+        profile.get("email")
+        or id_payload.get("email")
+        or email
+        or ""
+    )
+    account_id = (
+        auth_claim.get("chatgpt_account_id")
+        or id_auth_claim.get("chatgpt_account_id")
+        or team_account_id
+        or ""
+    )
+    exp_str = ""
+    try:
+        exp_ts = int(access_payload.get("exp") or 0)
+        if exp_ts > 0:
+            exp_str = datetime.fromtimestamp(exp_ts, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    except Exception:
+        exp_str = ""
+
+    now_str = datetime.now(tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    safe_email = re.sub(r"[^A-Za-z0-9_.@+-]+", "_", (email or resolved_email or "unknown").lower())
+    token_dir = os.path.join(_REPO_DIR, "cpas")
+    os.makedirs(token_dir, exist_ok=True)
+    token_path = os.path.join(token_dir, f"codex-{safe_email}-plus.json")
+    payload = {
+        "type": "codex",
+        "email": resolved_email,
+        "expired": exp_str,
+        "id_token": id_token,
+        "account_id": account_id,
+        "access_token": access_token,
+        "last_refresh": now_str,
+        "refresh_token": refresh_token,
+    }
+    if session_id or payment_channel or team_account_id:
+        meta_path = os.path.join(_OUTPUT_DIR, "codex_tokens")
+        os.makedirs(meta_path, exist_ok=True)
+        meta_file = os.path.join(meta_path, f"{safe_email}.json")
+        meta_payload = dict(payload)
+        meta_payload.update({
+            "session_id": session_id,
+            "payment_channel": payment_channel,
+            "team_account_id": team_account_id,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        })
+        with open(meta_file, "w", encoding="utf-8") as f:
+            json.dump(meta_payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+    with open(token_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return token_path
+
+
+def _save_oauth_callback_json(
+    email: str,
+    callback_info: dict,
+    *,
+    session_id: str = "",
+    payment_channel: str = "",
+    team_account_id: str = "",
+) -> str:
+    callback_info = callback_info if isinstance(callback_info, dict) else {}
+    code = callback_info.get("code", "") or ""
+    callback_url = callback_info.get("callback_url", "") or ""
+    scope = callback_info.get("scope", "") or ""
+    state = callback_info.get("state", "") or ""
+    now_str = datetime.now(tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    safe_email = re.sub(r"[^A-Za-z0-9_.@+-]+", "_", (email or "unknown").lower())
+    token_dir = os.path.join(_REPO_DIR, "cpas")
+    os.makedirs(token_dir, exist_ok=True)
+    token_path = os.path.join(token_dir, f"codex-{safe_email}-plus.json")
+    payload = {
+        "type": "codex",
+        "email": email,
+        "expired": "",
+        "id_token": "",
+        "account_id": team_account_id or "",
+        "access_token": "",
+        "last_refresh": now_str,
+        "refresh_token": "",
+        "authorization_code": code,
+        "callback_url": callback_url,
+        "scope": scope,
+        "state": state,
+    }
+    with open(token_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+    meta_payload = dict(payload)
+    meta_payload.update({
+        "session_id": session_id,
+        "payment_channel": payment_channel,
+        "team_account_id": team_account_id,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    })
+    meta_dir = os.path.join(_OUTPUT_DIR, "codex_tokens")
+    os.makedirs(meta_dir, exist_ok=True)
+    with open(os.path.join(meta_dir, f"{safe_email}.json"), "w", encoding="utf-8") as f:
+        json.dump(meta_payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    try:
+        get_db().set_runtime_json(f"oauth_callback:{safe_email}", meta_payload)
+    except Exception as e:
+        _log(f"      [RT] callback 写入数据库异常: {e}")
+    return token_path
+
+
+def _fetch_openai_login_otp(
+    target_email: str,
+    timeout: int = 180,
+    issued_after: float | None = None,
+) -> str:
     """从 CF KV 取 OpenAI 登录 OTP（worker 已替代 IMAP→QQ 转发链路）。
 
     返回空串表示超时或 KV 路径配置缺失，调用方按需 fallback。
@@ -5065,7 +5231,11 @@ def _fetch_openai_login_otp(target_email: str, timeout: int = 180) -> str:
         return ""
     try:
         provider = CloudflareKVOtpProvider.from_env_or_secrets()
-        return provider.wait_for_otp(target_email, timeout=timeout)
+        return provider.wait_for_otp(
+            target_email,
+            timeout=timeout,
+            issued_after=issued_after,
+        )
     except TimeoutError:
         _log(f"      [RT-OTP] CF KV 等 OTP 超时 {timeout}s")
         return ""
@@ -5107,11 +5277,121 @@ def _codex_oauth_client_id_from_config(cfg: dict) -> str:
     )
 
 
+def _exchange_codex_authorization_code(
+    code: str,
+    verifier: str,
+    *,
+    redirect_uri: str,
+    client_id: str,
+    user_agent: str = "",
+    proxy_url: str = "",
+) -> dict:
+    """Exchange a captured Codex OAuth authorization code for the real token bundle."""
+    if not code or not verifier:
+        return {}
+
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    if user_agent:
+        headers["User-Agent"] = user_agent
+
+    def _new_token_session(kind: str):
+        if kind == "curl_cffi_reference" and _HAS_CURL_CFFI and curl_requests is not None:
+            return curl_requests.Session(impersonate="chrome136")
+        if kind == "curl_cffi_session" and _HAS_CURL_CFFI:
+            return CurlCffiSession(impersonate="chrome136")
+        return requests.Session()
+
+    session_kinds = ["curl_cffi_reference", "curl_cffi_session", "requests"] if _HAS_CURL_CFFI else ["requests"]
+    last_error = ""
+    for kind in session_kinds:
+        http = _new_token_session(kind)
+        if kind == "curl_cffi_reference":
+            if proxy_url:
+                http.proxies = {"http": proxy_url, "https": proxy_url}
+        else:
+            _apply_proxy_to_http_session(http, proxy_url)
+        try:
+            resp = http.post(
+                "https://auth.openai.com/oauth/token",
+                headers=headers,
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                    "client_id": client_id,
+                    "code_verifier": verifier,
+                },
+                timeout=60,
+            )
+            _log(f"      [RT] /oauth/token ({kind}) -> {resp.status_code}")
+            if resp.status_code != 200:
+                _log(f"      [RT] /oauth/token ({kind}) 失败响应: {getattr(resp, 'text', '')[:240]}")
+                return {}
+            data = resp.json()
+            if isinstance(data, dict) and data.get("access_token"):
+                _log(f"      [RT] /oauth/token ({kind}) ✅ Token 换取成功")
+                return data
+            _log(f"      [RT] /oauth/token ({kind}) 响应缺少 access_token")
+            return {}
+        except Exception as e:
+            last_error = str(e)
+            _log(f"      [RT] /oauth/token ({kind}) 异常: {last_error}")
+            if kind.startswith("curl_cffi"):
+                _log("      [RT] curl_cffi TLS 失败，继续尝试下一个 /oauth/token 客户端 ...")
+                continue
+            break
+    if last_error:
+        _log(f"      [RT] /oauth/token 最终失败: {last_error[:240]}")
+    return {}
+
+
+def _exchange_codex_authorization_code_via_page(
+    page,
+    code: str,
+    verifier: str,
+    *,
+    redirect_uri: str,
+    client_id: str,
+    user_agent: str = "",
+) -> dict:
+    """Use Playwright's request context while the browser is alive."""
+    if not code or not verifier:
+        return {}
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    if user_agent:
+        headers["User-Agent"] = user_agent
+    try:
+        resp = page.request.post(
+            "https://auth.openai.com/oauth/token",
+            headers=headers,
+            form={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "code_verifier": verifier,
+            },
+            timeout=60000,
+        )
+        _log(f"      [RT] /oauth/token (browser-request) -> {resp.status}")
+        if resp.status != 200:
+            _log(f"      [RT] /oauth/token (browser-request) 失败响应: {resp.text()[:240]}")
+            return {}
+        data = resp.json()
+        if isinstance(data, dict) and data.get("access_token"):
+            _log("      [RT] /oauth/token (browser-request) ✅ Token 换取成功")
+            return data
+        _log("      [RT] /oauth/token (browser-request) 响应缺少 access_token")
+    except Exception as e:
+        _log(f"      [RT] /oauth/token (browser-request) 异常: {e}")
+    return {}
+
+
 def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: dict,
                                           proxy_url: str = "",
                                           oauth_client_id: str = "") -> str:
     """
-    支付成功后重新登录换 refresh_token。
+    支付成功后重新登录捕获 Codex OAuth localhost callback。
     流程：
       1. Camoufox 打开 Codex authorize URL
       2. 重定向到 auth.openai.com/log-in
@@ -5119,7 +5399,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
       4. 可能触发 Turnstile (Camoufox 自动过) / OTP (IMAP 取)
       5. workspace/select (选择默认 workspace)
       6. 自动 authorize Codex client → localhost callback
-      7. POST /oauth/token 换 refresh_token
+      7. 用 authorization_code + PKCE verifier 换取 token，再保存有效 CPA JSON
     """
     import base64 as _b64
     import hashlib as _hashlib
@@ -5129,6 +5409,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
     from urllib.parse import urlparse as _urlparse, urlencode as _urlencode, parse_qs as _parse_qs
     from camoufox.sync_api import Camoufox
     from browserforge.fingerprints import Screen
+    global _LAST_CODEX_CALLBACK, _LAST_CODEX_TOKEN_BUNDLE
 
     def _b64url_nopad(raw: bytes) -> str:
         return _b64.urlsafe_b64encode(raw).decode().rstrip("=")
@@ -5170,6 +5451,8 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
     has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     tmp_profile = _tmp.mkdtemp(prefix="rt_login_")
     code_captured = {"url": ""}
+    browser_user_agent = ""
+    token_bundle_captured = {}
 
     try:
         with Camoufox(
@@ -5184,6 +5467,10 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
             locale="en-US",
         ) as ctx:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            try:
+                browser_user_agent = page.evaluate("() => navigator.userAgent") or ""
+            except Exception:
+                browser_user_agent = ""
 
             # localhost 拦截
             def _intercept(route):
@@ -5200,14 +5487,29 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
 
             # [1] goto Codex authorize → 触发登录
             _log("      [RT] 打开 Codex authorize URL ...")
-            try:
-                page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
-            except Exception as e_nav:
-                _log(f"      [RT] goto 异常: {str(e_nav)[:120]}")
+            nav_ok = False
+            last_nav_error = ""
+            for nav_attempt in range(1, 4):
+                try:
+                    page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
+                    nav_ok = True
+                    break
+                except Exception as e_nav:
+                    last_nav_error = str(e_nav)
+                    _log(f"      [RT] goto 异常({nav_attempt}/3): {last_nav_error[:120]}")
+                    time.sleep(2 * nav_attempt)
             time.sleep(3)
             _log(f"      [RT] 当前 URL: {page.url[:120]}")
+            if not nav_ok and page.url == "about:blank":
+                try:
+                    page.screenshot(path="/tmp/rt_authorize_goto_failed.png")
+                except Exception:
+                    pass
+                _log(f"      [RT] authorize 页面未打开，放弃本次 callback 获取: {last_nav_error[:160]}")
+                return ""
 
             # [2] 填邮箱
+            otp_sent_ts = time.time()
             try:
                 page.wait_for_selector('input[type="email"], input[name="email"]',
                                        state="visible", timeout=20000)
@@ -5220,6 +5522,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                     b = page.query_selector(sel)
                     if b and b.is_visible():
                         b.click()
+                        otp_sent_ts = time.time()
                         _log("      [RT] 邮箱提交")
                         break
                 time.sleep(3)
@@ -5229,7 +5532,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
 
             # [3] 填密码（OpenAI 现在很多场景走 passwordless，没密码框就跳过到 OTP）
             try:
-                page.wait_for_selector('input[type="password"]', state="visible", timeout=20000)
+                page.wait_for_selector('input[type="password"]', state="visible", timeout=2000)
                 pwd_input = page.query_selector('input[type="password"]:visible')
                 pwd_input.click(); time.sleep(0.3)
                 pwd_input.fill(password)
@@ -5250,7 +5553,6 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
             _safe_screenshot(page, "/tmp/rt_after_pwd.png")
             # 最长等 4 分钟看能不能到 localhost callback
             end = time.time() + 240
-            otp_sent_ts = time.time()
             otp_fetched = False
             last_url = ""
             last_log_ts = 0.0
@@ -5272,8 +5574,12 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                     page.query_selector('input[autocomplete="one-time-code"]') or
                     page.query_selector('input[inputmode="numeric"]')):
                     if not otp_fetched:
-                        _log("      [RT] 检测到 OTP 页面，从 IMAP 取验证码 ...")
-                        otp_code = _fetch_openai_login_otp(target_email=email, timeout=180)
+                        _log("      [RT] 检测到 OTP 页面，从 CF KV 取验证码 ...")
+                        otp_code = _fetch_openai_login_otp(
+                            target_email=email,
+                            timeout=180,
+                            issued_after=otp_sent_ts,
+                        )
                         if not otp_code:
                             _log("      [RT] OTP 获取超时")
                             return ""
@@ -5414,6 +5720,29 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                             pass
                 time.sleep(1)
 
+            if code_captured["url"]:
+                code_in_browser = _parse_qs(_urlparse(code_captured["url"]).query).get("code", [""])[0]
+                if code_in_browser:
+                    qs_in_browser = _parse_qs(_urlparse(code_captured["url"]).query)
+                    _LAST_CODEX_CALLBACK = {
+                        "email": email,
+                        "code": code_in_browser,
+                        "callback_url": code_captured["url"],
+                        "scope": (qs_in_browser.get("scope") or [""])[0],
+                        "state": (qs_in_browser.get("state") or [""])[0],
+                        "captured_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    token_bundle_captured = _exchange_codex_authorization_code_via_page(
+                        page,
+                        code_in_browser,
+                        verifier,
+                        redirect_uri=codex_redirect,
+                        client_id=codex_client_id,
+                        user_agent=browser_user_agent,
+                    )
+                    if token_bundle_captured.get("refresh_token"):
+                        _LAST_CODEX_TOKEN_BUNDLE = token_bundle_captured
+
             try:
                 page.unroute("http://localhost:1455/**")
             except Exception:
@@ -5432,33 +5761,34 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
     if not code:
         _log(f"      [RT] callback 无 code: {cb_url[:150]}")
         return ""
-    _log(f"      [RT] 获得 code，POST /oauth/token 换 refresh_token ...")
-    try:
-        from curl_cffi.requests import Session as CffiSession
-        http_rt = CffiSession(impersonate="chrome136")
-        if proxy_url:
-            _apply_proxy_to_http_session(http_rt, proxy_url)
-        r = http_rt.post(
-            "https://auth.openai.com/oauth/token",
-            data={
-                "grant_type": "authorization_code",
-                "client_id": codex_client_id,
-                "code": code,
-                "redirect_uri": codex_redirect,
-                "code_verifier": verifier,
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded",
-                     "Accept": "application/json"},
-            timeout=30,
-        )
-        if r.status_code != 200:
-            _log(f"      [RT] /oauth/token: {r.status_code} {r.text[:200]}")
-            return ""
-        tj = r.json()
-        return tj.get("refresh_token", "") or ""
-    except Exception as e_tok:
-        _log(f"      [RT] /oauth/token 异常: {e_tok}")
-        return ""
+    qs = _parse_qs(_urlparse(cb_url).query)
+    _LAST_CODEX_CALLBACK = {
+        "email": email,
+        "code": code,
+        "callback_url": cb_url,
+        "scope": (qs.get("scope") or [""])[0],
+        "state": (qs.get("state") or [""])[0],
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if token_bundle_captured.get("refresh_token"):
+        _log(f"      [RT] 获得 refresh_token: {token_bundle_captured.get('refresh_token', '')[:20]}...")
+        return token_bundle_captured.get("refresh_token", "")
+
+    token_bundle = _exchange_codex_authorization_code(
+        code,
+        verifier,
+        redirect_uri=codex_redirect,
+        client_id=codex_client_id,
+        user_agent=browser_user_agent,
+        proxy_url=proxy_url,
+    )
+    if token_bundle.get("refresh_token"):
+        _LAST_CODEX_TOKEN_BUNDLE = token_bundle
+        _log(f"      [RT] 获得 refresh_token: {token_bundle.get('refresh_token', '')[:20]}...")
+        return token_bundle.get("refresh_token", "")
+
+    _log(f"      [RT] 已捕获 localhost callback code，但 token 换取失败，避免覆盖 CPA token JSON: {code[:20]}...")
+    return _OAUTH_CODE_PREFIX + code
 
 
 def _paypal_browser_authorize(
@@ -8670,7 +9000,7 @@ def run(
     except Exception:
         pass
 
-    # 支付成功才拿 refresh_token（失败不拿）
+    # 支付成功才重新登录捕获 Codex localhost callback（失败不捕获）
     if result_state == "succeeded" and chatgpt_email:
         try:
             # 从 SQLite 主存储取本账号的 password。
@@ -8696,19 +9026,48 @@ def run(
                     _log(f"      [RT] 读取 mail 配置失败: {e}")
 
             if _password and _mail_cfg:
-                _log("      [RT] 支付成功，重新登录拿 refresh_token ...")
+                _log("      [RT] 支付成功，重新登录捕获 Codex localhost callback ...")
                 rt_value = _exchange_refresh_token_with_session(
 	                    email=chatgpt_email,
 	                    password=_password,
 	                    mail_cfg=_mail_cfg,
 	                    proxy_url=_build_proxy_url_from_cfg(cfg.get("proxy")) if isinstance(cfg, dict) else "",
 	                    oauth_client_id=_codex_oauth_client_id_from_config(cfg),
-	                )
+                )
                 if rt_value:
-                    extra_info["refresh_token"] = rt_value
-                    _log(f"      [RT] ✅ 获得 refresh_token 长度={len(rt_value)}")
+                    if rt_value.startswith(_OAUTH_CODE_PREFIX):
+                        callback_info = dict(_LAST_CODEX_CALLBACK or {})
+                        if not callback_info.get("code"):
+                            callback_info["code"] = rt_value[len(_OAUTH_CODE_PREFIX):]
+                        _log(f"      [RT] ⚠️ 已捕获 localhost callback code 长度={len(callback_info.get('code', ''))}")
+                        _log("      [RT] 未换出 access_token/refresh_token，已跳过 CPA JSON 覆盖")
+                    else:
+                        extra_info["refresh_token"] = rt_value
+                        token_bundle = dict(_LAST_CODEX_TOKEN_BUNDLE or {})
+                        if token_bundle.get("refresh_token") != rt_value:
+                            token_bundle = {}
+                        if token_bundle.get("access_token"):
+                            _log("      [RT] 使用 authorization_code 返回的完整 token 包")
+                        else:
+                            _log("      [RT] 未发现完整 token 包，仅保存已有 refresh_token")
+                        if token_bundle.get("refresh_token"):
+                            extra_info["refresh_token"] = token_bundle.get("refresh_token") or rt_value
+                        if token_bundle.get("access_token"):
+                            _log("      [RT] 已换出 access_token/id_token，准备保存 CPA JSON")
+                        else:
+                            _log("      [RT] 未换出完整 token，仍保存同结构 JSON 便于排查")
+                        token_path = _save_refresh_token_json(
+                            chatgpt_email,
+                            extra_info.get("refresh_token") or rt_value,
+                            token_bundle=token_bundle,
+                            session_id=session_id,
+                            payment_channel=payment_channel,
+                            team_account_id=extra_info.get("team_account_id", ""),
+                        )
+                        _log(f"      [RT] ✅ 获得 refresh_token 长度={len(rt_value)}")
+                        _log(f"      [RT] CPA token JSON 已保存: {token_path}")
                 else:
-                    _log("      [RT] ❌ refresh_token 获取失败（不影响支付结果）")
+                    _log("      [RT] ❌ callback 获取失败（不影响支付结果）")
             else:
                 _log(f"      [RT] 缺少条件，跳过 (password={bool(_password)} mail_cfg={bool(_mail_cfg)})")
         except Exception as e:

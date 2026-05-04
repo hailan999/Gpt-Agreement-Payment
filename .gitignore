@@ -65,3 +65,4 @@ Thumbs.db
 test_*.py
 !test_rt.py.example
 !webui/tests/test_*.py
+cpas/

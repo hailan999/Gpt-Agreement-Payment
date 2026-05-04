@@ -4,6 +4,9 @@
     "country_code": "62",
     "phone_number": "81234567890",
     "pin": "YOUR_6_DIGIT_GOPAY_PIN",
+    "link_rate_limit_retry_limit": 4,
+    "link_rate_limit_sleep_s": 10,
+    "link_rate_limit_jitter_s": 1,
     "otp": {
       "source": "auto",
       "timeout": 300,

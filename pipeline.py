@@ -21,9 +21,11 @@ Pipeline 调度器：注册 ChatGPT 账号 → Stripe/PayPal 支付
 """
 
 import argparse
+import base64
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -31,6 +33,21 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _configure_console_encoding() -> None:
+    """Keep console output from crashing under UTF-8 or legacy GBK shells."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
+_configure_console_encoding()
 
 from webui.backend.db import get_db
 
@@ -609,6 +626,7 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
     env.pop("HTTPS_PROXY", None)
     env.pop("http_proxy", None)
     env.pop("https_proxy", None)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     if proxy:
         # 代理通过配置文件传递，不通过环境变量
 
@@ -620,7 +638,7 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
 
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, env=env, cwd=str(CARDW_DIR),
+        text=True, encoding="utf-8", errors="replace", env=env, cwd=str(CARDW_DIR),
     )
 
     result_json = None
@@ -795,6 +813,7 @@ def pay(card_config_path, session_token=None, access_token=None,
     env = dict(os.environ)
     env.pop("HTTP_PROXY", None)
     env.pop("HTTPS_PROXY", None)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     if not env.get("OAUTH_CODEX_CLIENT_ID"):
         client_id = _codex_oauth_client_id_from_card_cfg(cfg_for_env)
         if client_id:
@@ -807,7 +826,7 @@ def pay(card_config_path, session_token=None, access_token=None,
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, env=env,
+            text=True, encoding="utf-8", errors="replace", env=env,
         )
         deadline = time.time() + timeout
         for line in proc.stdout:
@@ -2535,6 +2554,97 @@ def _find_latest_refresh_token_for_email(email, session_id=""):
     return ""
 
 
+def _decode_jwt_payload_local(token: str) -> dict:
+    if not token or token.count(".") < 2:
+        return {}
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _infer_codex_plan_tag(payload: dict, fallback: str = "plus") -> str:
+    for token_key in ("access_token", "id_token"):
+        token_payload = _decode_jwt_payload_local(payload.get(token_key, ""))
+        auth_claim = token_payload.get("https://api.openai.com/auth", {})
+        if not isinstance(auth_claim, dict):
+            continue
+        plan_type = str(auth_claim.get("chatgpt_plan_type") or "").strip().lower()
+        if plan_type:
+            if "plus" in plan_type:
+                return "plus"
+            if "team" in plan_type or "business" in plan_type:
+                return "team"
+            if "enterprise" in plan_type:
+                return "enterprise"
+            if "free" in plan_type:
+                return "free"
+            return re.sub(r"[^A-Za-z0-9_.@+-]+", "_", plan_type) or fallback
+    return fallback
+
+
+def _save_local_codex_json(email: str, payload: dict, plan_tag: str = "plus") -> str:
+    safe_email = re.sub(r"[^A-Za-z0-9_.@+-]+", "_", (email or payload.get("email") or "unknown").lower())
+    resolved_plan = _infer_codex_plan_tag(payload, plan_tag or "plus")
+    safe_plan = re.sub(r"[^A-Za-z0-9_.@+-]+", "_", resolved_plan.lower())
+    token_dir = ROOT / "cpas"
+    token_dir.mkdir(parents=True, exist_ok=True)
+    token_path = token_dir / f"codex-{safe_email}-{safe_plan}.json"
+    if not payload.get("access_token") and token_path.exists():
+        try:
+            existing = json.loads(token_path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict) and existing.get("access_token"):
+                return str(token_path)
+        except Exception:
+            pass
+    body = {
+        "type": "codex",
+        "email": payload.get("email") or email,
+        "expired": payload.get("expired", ""),
+        "id_token": payload.get("id_token", ""),
+        "account_id": payload.get("account_id", ""),
+        "access_token": payload.get("access_token", ""),
+        "last_refresh": payload.get("last_refresh", ""),
+        "refresh_token": payload.get("refresh_token", ""),
+    }
+    with open(token_path, "w", encoding="utf-8") as f:
+        json.dump(body, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return str(token_path)
+
+
+def _load_valid_local_codex_json(email: str, refresh_token: str = "") -> dict:
+    safe_email = re.sub(r"[^A-Za-z0-9_.@+-]+", "_", (email or "unknown").lower())
+    candidates = list((ROOT / "cpas").glob(f"codex-{safe_email}-*.json"))
+    candidates.append(ROOT / "output" / "codex_tokens" / f"{safe_email}.json")
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict) or not data.get("access_token"):
+            continue
+        if refresh_token and data.get("refresh_token") != refresh_token:
+            continue
+        return data
+    return {}
+
+
+def _latest_card_token_bundle(refresh_token: str = "") -> dict:
+    card_mod = sys.modules.get("card")
+    bundle = getattr(card_mod, "_LAST_CODEX_TOKEN_BUNDLE", {}) if card_mod else {}
+    if not isinstance(bundle, dict) or not bundle.get("access_token"):
+        return {}
+    if refresh_token and bundle.get("refresh_token") != refresh_token:
+        return {}
+    return dict(bundle)
+
+
 def _augment_card_result_last_match(email, session_id, extra_fields):
     """倒序找到首条匹配 email(+session_id) 的支付记录并补字段。"""
     try:
@@ -2687,13 +2797,19 @@ def _cpa_import_after_team(
     import urllib.request, urllib.parse, urllib.error, base64, hashlib
     if not cpa_cfg or not cpa_cfg.get("enabled"):
         return "skipped"
+    local_only = bool(cpa_cfg.get("local_only") or cpa_cfg.get("upload_enabled") is False)
     base_url = (cpa_cfg.get("base_url") or "").rstrip("/")
     admin_key = (cpa_cfg.get("admin_key") or "").strip()
-    if not base_url or not admin_key or not email:
+    if not email:
+        return "skipped"
+    if not local_only and (not base_url or not admin_key):
         return "skipped"
 
     rt = (refresh_token or "").strip() or _find_latest_refresh_token_for_email(email, sid)
     reg_acc = _find_latest_registered_account_for_email(email)
+    plan_tag = (cpa_cfg.get("plan_tag") or "team").strip() or "team"
+    if is_free:
+        plan_tag = (cpa_cfg.get("free_plan_tag") or "free").strip() or "free"
     if not rt:
         # 真实支付后，refresh_token 可能因为 add-phone / rate-limit / 401 等原因
         # 无法及时拿到；此时至少保留已注册账号里的 access_token 做“裸导入”
@@ -2725,10 +2841,11 @@ def _cpa_import_after_team(
             "type": "codex",
         }
         print(f"[CPA] {email} 无 refresh_token，回退使用现有 access_token 裸导入")
+        token_path = _save_local_codex_json(email, body, plan_tag)
+        print(f"[CPA] {email} 本地 JSON 已保存: {token_path}")
+        if local_only:
+            return "local_saved"
         tag = hashlib.md5(email.encode()).hexdigest()[:8]
-        plan_tag = (cpa_cfg.get("plan_tag") or "team").strip() or "team"
-        if is_free:
-            plan_tag = (cpa_cfg.get("free_plan_tag") or "free").strip() or "free"
         name = f"codex-{tag}-{email}-{plan_tag}.json"
         try:
             try:
@@ -2776,34 +2893,53 @@ def _cpa_import_after_team(
     client_id = cpa_cfg.get("oauth_client_id") or "app_EMoamEEZ73f0CkXaXp7hrann"
     at, id_tok, account_id = "", "", ""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 不走本地 proxy
+    token_bundle = _latest_card_token_bundle(rt)
+    if not token_bundle:
+        token_bundle = _load_valid_local_codex_json(email, rt)
+    if token_bundle:
+        at = token_bundle.get("access_token", "") or ""
+        id_tok = token_bundle.get("id_token", "") or at
+        rt = token_bundle.get("refresh_token", rt) or rt
+        payload = _decode_jwt_payload_local(at)
+        account_id = (payload.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id", "") or ""
     try:
-        data = urllib.parse.urlencode({
-            "grant_type": "refresh_token",
-            "refresh_token": rt,
-            "client_id": client_id,
-            "scope": "openid email profile offline_access",
-        }).encode()
-        req = urllib.request.Request(
-            "https://auth.openai.com/oauth/token", data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded",
-                     "Accept": "application/json"},
-            method="POST",
-        )
-        with opener.open(req, timeout=20) as r:
-            tok = json.loads(r.read().decode())
-        at = tok.get("access_token", "") or ""
-        id_tok = tok.get("id_token", "") or at
-        rt = tok.get("refresh_token", rt) or rt
-        if at:
-            try:
-                p = at.split(".")[1]
-                p += "=" * (4 - len(p) % 4)
-                payload = json.loads(base64.urlsafe_b64decode(p).decode())
-                account_id = (payload.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id", "") or ""
-            except Exception:
-                pass
+        if not at:
+            data = urllib.parse.urlencode({
+                "grant_type": "refresh_token",
+                "refresh_token": rt,
+                "client_id": client_id,
+                "scope": "openid email profile offline_access",
+            }).encode()
+            req = urllib.request.Request(
+                "https://auth.openai.com/oauth/token", data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded",
+                         "Accept": "application/json"},
+                method="POST",
+            )
+            with opener.open(req, timeout=20) as r:
+                tok = json.loads(r.read().decode())
+            at = tok.get("access_token", "") or ""
+            id_tok = tok.get("id_token", "") or at
+            rt = tok.get("refresh_token", rt) or rt
+            if at:
+                try:
+                    p = at.split(".")[1]
+                    p += "=" * (4 - len(p) % 4)
+                    payload = json.loads(base64.urlsafe_b64decode(p).decode())
+                    account_id = (payload.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id", "") or ""
+                except Exception:
+                    pass
     except Exception as e:
         print(f"[CPA] {email} refresh_token 交换失败（仍尝试裸导入）: {e}")
+
+    if local_only and not at:
+        existing = _load_valid_local_codex_json(email, rt)
+        if existing:
+            token_path = _save_local_codex_json(email, existing, plan_tag)
+            print(f"[CPA] {email} 复用已有本地 JSON: {token_path}")
+            return "local_saved"
+        print(f"[CPA] {email} 未拿到 access_token，跳过本地 JSON 覆盖")
+        return "no_json"
 
     # 构造 codex 文件
     expired_iso = ""
@@ -2822,10 +2958,11 @@ def _cpa_import_after_team(
         "account_id": account_id, "email": email,
         "last_refresh": now_iso, "expired": expired_iso, "type": "codex",
     }
+    token_path = _save_local_codex_json(email, body, plan_tag)
+    print(f"[CPA] {email} 本地 JSON 已保存: {token_path}")
+    if local_only:
+        return "local_saved"
     tag = hashlib.md5(email.encode()).hexdigest()[:8]
-    plan_tag = (cpa_cfg.get("plan_tag") or "team").strip() or "team"
-    if is_free:
-        plan_tag = (cpa_cfg.get("free_plan_tag") or "free").strip() or "free"
     name = f"codex-{tag}-{email}-{plan_tag}.json"
     try:
         # 走 curl_cffi（chrome TLS+UA 指纹）规避 CF WAF；不可用则降级 urllib
@@ -3080,6 +3217,10 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
             if not rt:
                 entry["status"] = "no_rt"
                 continue
+            if str(rt).startswith("oauth_code:"):
+                entry["status"] = "callback_captured_no_rt"
+                print(f"[self-dealer] ✗ {mem_email} 仅捕获 callback code，未拿到 refresh_token")
+                continue
 
             # 追加一条支付成功记录，让 _cpa_import_after_team 能读到
             sid = f"self-dealer-m{i}-{mem_email.split('@')[0][:20]}"
@@ -3197,13 +3338,19 @@ def free_register_loop(card_config_path, cardw_config_path=None, count: int = 0)
             rt, fail = _exchange_rt_with_classification(email, password, mail_cfg, proxy_url)
 
             if rt:
-                print(f"[free] [{iteration}] register {email} → succeeded rt_len={len(rt)}")
-                _set_account_oauth_status(email, "succeeded")
-                if cpa_cfg.get("enabled"):
+                if str(rt).startswith("oauth_code:"):
+                    _set_account_oauth_status(email, "transient_failed", "token_exchange_failed")
+                    print(f"[free] [{iteration}] register {email} → callback_captured code_len={len(rt) - len('oauth_code:')}")
+                elif cpa_cfg.get("enabled"):
+                    _set_account_oauth_status(email, "succeeded")
+                    print(f"[free] [{iteration}] register {email} → succeeded rt_len={len(rt)}")
                     cpa_st = _cpa_import_after_team(
                         email, sid, cpa_cfg, refresh_token=rt, is_free=True,
                     )
                     print(f"[free] [{iteration}] cpa({email}) → {cpa_st}")
+                else:
+                    _set_account_oauth_status(email, "succeeded")
+                    print(f"[free] [{iteration}] register {email} → succeeded rt_len={len(rt)}")
                 succeeded += 1
             else:
                 if fail == "account_dead":
@@ -3296,13 +3443,19 @@ def free_backfill_rt_loop(card_config_path, cardw_config_path=None):
         rt, fail = _exchange_rt_with_classification(email, password, mail_cfg, proxy_url)
 
         if rt:
-            print(f"[free] [{i}/{len(todo)}] backfill {email} → succeeded rt_len={len(rt)}")
-            _set_account_oauth_status(email, "succeeded")
-            if cpa_cfg.get("enabled"):
+            if str(rt).startswith("oauth_code:"):
+                _set_account_oauth_status(email, "transient_failed", "token_exchange_failed")
+                print(f"[free] [{i}/{len(todo)}] backfill {email} → callback_captured code_len={len(rt) - len('oauth_code:')}")
+            elif cpa_cfg.get("enabled"):
+                _set_account_oauth_status(email, "succeeded")
+                print(f"[free] [{i}/{len(todo)}] backfill {email} → succeeded rt_len={len(rt)}")
                 cpa_st = _cpa_import_after_team(
                     email, sid, cpa_cfg, refresh_token=rt, is_free=True,
                 )
                 print(f"[free] [{i}/{len(todo)}] cpa({email}) → {cpa_st}")
+            else:
+                _set_account_oauth_status(email, "succeeded")
+                print(f"[free] [{i}/{len(todo)}] backfill {email} → succeeded rt_len={len(rt)}")
             succeeded += 1
         else:
             if fail == "account_dead":

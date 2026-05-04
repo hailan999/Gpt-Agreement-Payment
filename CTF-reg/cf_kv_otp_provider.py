@@ -55,7 +55,7 @@ class CloudflareKVOtpProvider:
         account_id: str,
         kv_namespace_id: str,
         poll_interval_s: float = 1.0,
-        delete_after_read: bool = True,
+        delete_after_read: bool = False,
     ):
         self.token = api_token
         self.account_id = account_id
@@ -207,14 +207,14 @@ class CloudflareKVOtpProvider:
         """Poll KV until an OTP keyed by `email_addr` shows up.
 
         - issued_after (epoch seconds): only accept entries written at or
-          after this timestamp (-3s grace for clock skew). Defaults to now,
+          shortly before this timestamp. Defaults to now,
           which means "ignore anything written before this call started".
         """
         key = email_addr.strip().lower()
         if issued_after is None:
             issued_after = time.time()
-        # 3s grace —— Worker 写入比 issued_after 早一点也算（CF 时钟轻微偏差）
-        accept_threshold_s = issued_after - 3.0
+        # 30s grace —— 邮件可能在页面检测到 OTP input 前已写入 KV。
+        accept_threshold_s = issued_after - 30.0
 
         deadline = time.time() + timeout
         start = time.time()

@@ -37,6 +37,7 @@ import argparse
 import datetime as _dt
 import json
 import os
+import random
 import re
 import shlex
 import subprocess
@@ -82,6 +83,9 @@ GOPAY_PIN_CLIENT_ID_CHARGE = "47180a8e-f56e-11ed-a05b-0242ac120003-GWC"
 DEFAULT_TIMEOUT = 30
 LINK_RETRY_LIMIT = 2  # 406 "account already linked" retry
 LINK_RETRY_SLEEP_S = 12.0  # Midtrans 需要冷却 ~10s 才会让 406 → 201（实测）
+LINK_RATE_LIMIT_RETRY_LIMIT = 4
+LINK_RATE_LIMIT_SLEEP_S = 10.0
+LINK_RATE_LIMIT_JITTER_S = 1.0
 DEFAULT_OTP_REGEX = r"(?<!\d)(\d{6})(?!\d)"
 
 
@@ -130,6 +134,17 @@ class GoPayCharger:
         self.pin = str(gopay_cfg["pin"])
         self.midtrans_client_id = str(
             gopay_cfg.get("midtrans_client_id") or DEFAULT_MIDTRANS_CLIENT_ID
+        )
+        self.link_retry_limit = int(gopay_cfg.get("link_retry_limit") or LINK_RETRY_LIMIT)
+        self.link_retry_sleep_s = float(gopay_cfg.get("link_retry_sleep_s") or LINK_RETRY_SLEEP_S)
+        self.link_rate_limit_retry_limit = int(
+            gopay_cfg.get("link_rate_limit_retry_limit") or LINK_RATE_LIMIT_RETRY_LIMIT
+        )
+        self.link_rate_limit_sleep_s = float(
+            gopay_cfg.get("link_rate_limit_sleep_s") or LINK_RATE_LIMIT_SLEEP_S
+        )
+        self.link_rate_limit_jitter_s = float(
+            gopay_cfg.get("link_rate_limit_jitter_s") or LINK_RATE_LIMIT_JITTER_S
         )
         self.otp_provider = otp_provider
         self.log = log
@@ -405,7 +420,7 @@ class GoPayCharger:
     # ───── Step 7: Midtrans linking initiation ─────
 
     def _midtrans_init_linking(self, snap_token: str) -> str:
-        """POST snap/v3/accounts/{snap}/linking. Retries on 406."""
+        """POST snap/v3/accounts/{snap}/linking. Retries on 406 and 429."""
         url = f"https://app.midtrans.com/snap/v3/accounts/{snap_token}/linking"
         body = {
             "type": "gopay",
@@ -419,7 +434,10 @@ class GoPayCharger:
             "Referer": f"https://app.midtrans.com/snap/v4/redirection/{snap_token}",
         }
         last_err: Optional[str] = None
-        for attempt in range(1, LINK_RETRY_LIMIT + 2):
+        max_attempts = max(self.link_retry_limit, self.link_rate_limit_retry_limit) + 1
+        rate_limit_hits = 0
+        conflict_hits = 0
+        for attempt in range(1, max_attempts + 1):
             r = self.ext.post(url, json=body, headers=headers, timeout=DEFAULT_TIMEOUT)
             if r.status_code == 201:
                 data = r.json()
@@ -440,8 +458,38 @@ class GoPayCharger:
                     last_err = str(j[0])
                 else:
                     last_err = r.text[:120]
-                self.log(f"[gopay] midtrans linking 406 ({last_err}), 冷却 {LINK_RETRY_SLEEP_S}s 再重试 {attempt}/{LINK_RETRY_LIMIT}")
-                time.sleep(LINK_RETRY_SLEEP_S)
+                conflict_hits += 1
+                if conflict_hits > self.link_retry_limit:
+                    break
+                self.log(
+                    f"[gopay] midtrans linking 406 ({last_err}), "
+                    f"冷却 {self.link_retry_sleep_s:.0f}s 再重试 "
+                    f"{conflict_hits}/{self.link_retry_limit}"
+                )
+                time.sleep(self.link_retry_sleep_s)
+                continue
+            if r.status_code == 429:
+                rate_limit_hits += 1
+                if rate_limit_hits > self.link_rate_limit_retry_limit:
+                    last_err = r.text[:120] or "rate limited"
+                    break
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    wait_s = float(retry_after) if retry_after else 0.0
+                except Exception:
+                    wait_s = 0.0
+                if wait_s <= 0:
+                    jitter = max(0.0, self.link_rate_limit_jitter_s)
+                    wait_s = random.uniform(
+                        max(0.2, self.link_rate_limit_sleep_s - jitter),
+                        self.link_rate_limit_sleep_s + jitter,
+                    )
+                self.log(
+                    f"[gopay] midtrans linking 429 rate limited, "
+                    f"冷却 {wait_s:.0f}s 再重试 "
+                    f"{rate_limit_hits}/{self.link_rate_limit_retry_limit}"
+                )
+                time.sleep(wait_s)
                 continue
             raise GoPayError(
                 f"midtrans linking unexpected status={r.status_code} body={r.text[:300]}",
