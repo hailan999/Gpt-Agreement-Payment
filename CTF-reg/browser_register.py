@@ -93,6 +93,26 @@ def _goto_with_retry(page, url: str, *, wait_until: str = "domcontentloaded", ti
         raise last_error
 
 
+def _fill_input_value(page, input_el, value: str) -> None:
+    try:
+        input_el.fill(value, timeout=5000)
+        return
+    except Exception:
+        pass
+    page.evaluate(
+        """([el, value]) => {
+            const proto = el instanceof HTMLInputElement
+                ? HTMLInputElement.prototype
+                : HTMLTextAreaElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+            setter.call(el, value);
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+        }""",
+        [input_el, value],
+    )
+
+
 def _is_register_restart_url(url: str) -> bool:
     """这些 auth 页面表示注册挑战态已经跑偏，本轮继续点按钮只会空转。"""
     try:
@@ -101,8 +121,6 @@ def _is_register_restart_url(url: str) -> bool:
         return False
     if parsed.netloc != "auth.openai.com":
         return False
-    if parsed.path == "/email-verification/register":
-        return True
     return parsed.path == "/api/accounts/authorize"
 
 
@@ -112,6 +130,22 @@ def _is_authorize_interstitial_url(url: str) -> bool:
     except Exception:
         return False
     return parsed.netloc == "auth.openai.com" and parsed.path == "/api/accounts/authorize"
+
+
+def _is_email_verification_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url or "")
+    except Exception:
+        return False
+    return parsed.netloc == "auth.openai.com" and parsed.path == "/email-verification"
+
+
+def _is_email_verification_register_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url or "")
+    except Exception:
+        return False
+    return parsed.netloc == "auth.openai.com" and parsed.path == "/email-verification/register"
 
 
 def _wait_out_authorize_interstitial(page, stage: str, timeout_s: int = 25) -> bool:
@@ -425,9 +459,43 @@ def browser_register(cfg, mail_provider) -> dict:
                     page.screenshot(path="/tmp/browser_reg_otp_fail.png")
                     raise RuntimeError("OTP 输入框未找到")
                 time.sleep(0.8)
+                if _is_email_verification_register_url(page.url):
+                    full_name = f"{first_name} {last_name}"
+                    legacy_age = str(random.randint(26, 40))
+                    name_input = (
+                        page.query_selector('input[name="name"]:visible') or
+                        page.query_selector('input[autocomplete="name"]:visible') or
+                        page.query_selector('input[placeholder="Full name"]:visible')
+                    )
+                    age_input = (
+                        page.query_selector('input[name="age"]:visible') or
+                        page.query_selector('input[placeholder="Age"]:visible') or
+                        page.query_selector('input[type="number"][inputmode="numeric"]:visible')
+                    )
+                    if not name_input or not age_input:
+                        page.screenshot(path="/tmp/browser_reg_inline_profile_missing.png")
+                        raise RuntimeError(
+                            "[browser-reg-retryable] email-verification/register 合并表单不完整，"
+                            f"name={bool(name_input)} age={bool(age_input)} url={page.url[:180]}"
+                    )
+                    try:
+                        _fill_input_value(page, name_input, full_name)
+                        time.sleep(random.uniform(0.2, 0.5))
+                        _fill_input_value(page, age_input, legacy_age)
+                        logger.info(
+                            f"[browser-reg] 填合并验证页 Full name={full_name} Age={legacy_age}"
+                        )
+                    except Exception as e:
+                        page.screenshot(path="/tmp/browser_reg_inline_profile_fill_fail.png")
+                        raise RuntimeError(
+                            "[browser-reg-retryable] email-verification/register 合并表单填写失败: "
+                            f"{e}"
+                        )
                 # Continue
-                for sel in ['button[type="submit"]', 'button:has-text("Continue")',
-                            'button:has-text("Verify")', 'button:has-text("Next")']:
+                for sel in ['button:has-text("Continue")',
+                            'button[data-dd-action-name="Continue"]',
+                            'button:has-text("Verify")', 'button:has-text("Next")',
+                            'button[type="submit"]:not([value="resend"])']:
                     b = page.query_selector(sel)
                     if b and b.is_visible():
                         b.click()
@@ -451,6 +519,35 @@ def browser_register(cfg, mail_provider) -> dict:
                     raise
                 except Exception:
                     pass
+
+                if _is_email_verification_register_url(page.url):
+                    logger.info("[browser-reg] 合并验证页提交后等待跳转 ...")
+                    for wait_i in range(20):
+                        time.sleep(1)
+                        if not _is_email_verification_register_url(page.url):
+                            logger.info(
+                                f"[browser-reg] 合并验证页已离开 -> {page.url[:120]}"
+                            )
+                            break
+                        try:
+                            err = page.query_selector(
+                                'text=/incorrect code|invalid code|wrong code|验证码不正确|验证码错误/i'
+                            )
+                            if err and err.is_visible():
+                                page.screenshot(path="/tmp/browser_reg_otp_rejected.png")
+                                raise RuntimeError(
+                                    f"OpenAI 拒绝 OTP {otp_code}（合并验证页）"
+                                )
+                        except RuntimeError:
+                            raise
+                        except Exception:
+                            pass
+                    if _is_email_verification_register_url(page.url):
+                        page.screenshot(path="/tmp/browser_reg_inline_profile_stuck.png")
+                        raise RuntimeError(
+                            "[browser-reg-retryable] email-verification/register 合并表单提交后未跳转，"
+                            f"本轮需要从头重试: url={page.url[:180]}"
+                        )
 
             # [6] /about-you：Full name + Age（单框）
             logger.info(f"[browser-reg] OTP 后 URL: {page.url[:120]}")
@@ -614,6 +711,12 @@ def browser_register(cfg, mail_provider) -> dict:
                     logger.info(f"[browser-reg] URL@{i}s: {cur[:120]}")
                     last_url = cur
                 _abort_on_register_restart_url(page, f"waiting_chatgpt_{i}s")
+                if _is_email_verification_url(cur):
+                    page.screenshot(path="/tmp/browser_reg_email_verification_deadend.png")
+                    raise RuntimeError(
+                        "[browser-reg-retryable] 注册流程回到 email-verification，"
+                        f"继续点击会空转，本轮跳过: url={cur[:180]}"
+                    )
                 # 到 chatgpt.com 且已加载 React 主界面
                 if "chatgpt.com" in cur and "auth.openai.com" not in cur:
                     # 等 /api/auth/session 能正常返回 accessToken 才算完成

@@ -874,10 +874,10 @@ def _accept_language_for_locale(locale_value: str | None) -> str:
     return "en-US,en;q=0.9"
 
 
-def _browser_like_session_headers(locale_value: str | None) -> dict:
+def _browser_like_session_headers(locale_value: str | None, user_agent: str = "") -> dict:
     """补一组更接近 flows 的浏览器请求头。"""
     return {
-        "User-Agent": USER_AGENT,
+        "User-Agent": user_agent or USER_AGENT,
         "Accept-Language": _accept_language_for_locale(locale_value),
         "Sec-CH-UA": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
         "Sec-CH-UA-Mobile": "?0",
@@ -1168,6 +1168,29 @@ def register_fingerprint(http: "requests.Session") -> tuple[str, str, str]:
 
     _log(f"      [指纹] 完成 → guid={guid[:25]}... muid={muid[:25]}... sid={sid[:25]}...")
     return guid, muid, sid
+
+
+def _resolve_preseeded_stripe_fingerprint(cfg: dict) -> dict:
+    """Return a pipeline-provided Stripe fingerprint bundle when available."""
+    if not isinstance(cfg, dict):
+        return {}
+    fp = (
+        cfg.get("stripe_fingerprint")
+        or cfg.get("payment_fingerprint")
+        or (cfg.get("runtime") or {}).get("stripe_fingerprint")
+    )
+    if not isinstance(fp, dict):
+        return {}
+    guid = str(fp.get("guid") or "").strip()
+    muid = str(fp.get("muid") or "").strip()
+    sid = str(fp.get("sid") or "").strip()
+    if not (guid and muid and sid):
+        return {}
+    result = {"guid": guid, "muid": muid, "sid": sid}
+    user_agent = str(fp.get("user_agent") or fp.get("userAgent") or "").strip()
+    if user_agent:
+        result["user_agent"] = user_agent
+    return result
 
 
 def _gen_elements_session_id():
@@ -5474,6 +5497,44 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
             except Exception:
                 browser_user_agent = ""
 
+            def _click_first_visible(selectors: list[str], label: str) -> bool:
+                for sel in selectors:
+                    try:
+                        b = page.query_selector(sel)
+                        if b and b.is_visible():
+                            b.click()
+                            _log(f"      [RT] {label}: {sel}")
+                            return True
+                    except Exception:
+                        pass
+                return False
+
+            def _log_auth_page_state(label: str) -> None:
+                try:
+                    state = page.evaluate("""
+                        () => ({
+                            title: document.title,
+                            inputs: Array.from(document.querySelectorAll('input')).map(i => ({
+                                type: i.type || '',
+                                name: i.name || '',
+                                autocomplete: i.autocomplete || '',
+                                placeholder: i.placeholder || '',
+                                value_len: (i.value || '').length,
+                                visible: !!(i.offsetWidth || i.offsetHeight || i.getClientRects().length),
+                            })).slice(0, 12),
+                            buttons: Array.from(document.querySelectorAll('button,a[role=button],[role=button]')).map(b => ({
+                                text: (b.innerText || b.textContent || '').trim().slice(0, 60),
+                                type: b.getAttribute('type') || '',
+                                disabled: !!b.disabled,
+                                visible: !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length),
+                            })).slice(0, 12),
+                            body: (document.body && document.body.innerText || '').trim().slice(0, 240),
+                        })
+                    """)
+                    _log(f"      [RT] {label} 页面状态: {state}")
+                except Exception as e:
+                    _log(f"      [RT] {label} 页面状态读取失败: {e}")
+
             # localhost 拦截
             def _intercept(route):
                 url = route.request.url
@@ -5520,31 +5581,53 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                 email_input.click(); time.sleep(0.3)
                 email_input.fill(email)
                 time.sleep(random.uniform(0.5, 1.2))
-                for sel in ['button[type="submit"]', 'button:has-text("Continue")', '#btnNext']:
-                    b = page.query_selector(sel)
-                    if b and b.is_visible():
-                        b.click()
-                        otp_sent_ts = time.time()
-                        _log("      [RT] 邮箱提交")
-                        break
+                clicked_email_continue = _click_first_visible([
+                    'button[type="submit"]',
+                    'button:has-text("Continue")',
+                    'button:has-text("Next")',
+                    'button:has-text("Log in")',
+                    'button:has-text("Sign in")',
+                    '#btnNext',
+                    '[data-testid*="continue"]',
+                    '[data-testid*="submit"]',
+                ], "邮箱提交")
+                if not clicked_email_continue:
+                    try:
+                        email_input.press("Enter")
+                        _log("      [RT] 邮箱提交: Enter")
+                        clicked_email_continue = True
+                    except Exception:
+                        pass
+                if clicked_email_continue:
+                    otp_sent_ts = time.time()
                 time.sleep(3)
+                if "auth.openai.com/log-in" in page.url:
+                    _log_auth_page_state("邮箱提交后仍在 log-in")
             except Exception as e:
                 _log(f"      [RT] 邮箱填写失败: {e}")
                 return ""
 
             # [3] 填密码（OpenAI 现在很多场景走 passwordless，没密码框就跳过到 OTP）
             try:
-                page.wait_for_selector('input[type="password"]', state="visible", timeout=2000)
+                page.wait_for_selector('input[type="password"]', state="visible", timeout=15000)
                 pwd_input = page.query_selector('input[type="password"]:visible')
                 pwd_input.click(); time.sleep(0.3)
                 pwd_input.fill(password)
                 time.sleep(random.uniform(0.5, 1.2))
-                for sel in ['button[type="submit"]', 'button:has-text("Continue")']:
-                    b = page.query_selector(sel)
-                    if b and b.is_visible():
-                        b.click()
-                        _log("      [RT] 密码提交")
-                        break
+                clicked_pwd_continue = _click_first_visible([
+                    'button[type="submit"]',
+                    'button:has-text("Continue")',
+                    'button:has-text("Log in")',
+                    'button:has-text("Sign in")',
+                    '[data-testid*="continue"]',
+                    '[data-testid*="submit"]',
+                ], "密码提交")
+                if not clicked_pwd_continue:
+                    try:
+                        pwd_input.press("Enter")
+                        _log("      [RT] 密码提交: Enter")
+                    except Exception:
+                        pass
                 time.sleep(5)
             except Exception as e:
                 _log(f"      [RT] 密码框超时（passwordless 路径），跳过到 OTP 等待: {str(e)[:80]}")
@@ -5558,6 +5641,59 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
             otp_fetched = False
             last_url = ""
             last_log_ts = 0.0
+            login_stuck_since = None
+            login_retry_count = 0
+
+            def _fill_email_verification_register_profile() -> bool:
+                name_input = (
+                    page.query_selector('input[name="name"]:visible') or
+                    page.query_selector('input[autocomplete="name"]:visible') or
+                    page.query_selector('input[placeholder="Full name"]:visible')
+                )
+                age_input = (
+                    page.query_selector('input[name="age"]:visible') or
+                    page.query_selector('input[placeholder="Age"]:visible') or
+                    page.query_selector('input[type="number"][inputmode="numeric"]:visible')
+                )
+                if not name_input or not age_input:
+                    return False
+                try:
+                    def _fill_input_value(input_el, value: str) -> None:
+                        try:
+                            input_el.fill(value, timeout=5000)
+                            return
+                        except Exception:
+                            pass
+                        page.evaluate(
+                            """([el, value]) => {
+                                const proto = el instanceof HTMLInputElement
+                                    ? HTMLInputElement.prototype
+                                    : HTMLTextAreaElement.prototype;
+                                const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+                                setter.call(el, value);
+                                el.dispatchEvent(new Event("input", { bubbles: true }));
+                                el.dispatchEvent(new Event("change", { bubbles: true }));
+                            }""",
+                            [input_el, value],
+                        )
+
+                    local = (email.split("@", 1)[0] if email else "").strip()
+                    parts = [p for p in re.split(r"[^A-Za-z]+", local.title()) if p]
+                    full_name = " ".join(parts[:2]) if len(parts) >= 2 else ""
+                    if not full_name:
+                        full_name = _random_cardholder_name()
+                    legacy_age = str(random.randint(26, 40))
+                    _fill_input_value(name_input, full_name)
+                    time.sleep(random.uniform(0.2, 0.5))
+                    _fill_input_value(age_input, legacy_age)
+                    page._rt_inline_profile_filled = True
+                    _log(f"      [RT] 填合并验证页 Full name={full_name} Age={legacy_age}")
+                    return True
+                except Exception as e:
+                    _safe_screenshot(page, "/tmp/rt_inline_profile_fill_fail.png")
+                    _log(f"      [RT] 合并验证页资料填写失败: {e}")
+                    return False
+
             while time.time() < end:
                 if code_captured["url"]:
                     break
@@ -5571,6 +5707,42 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                     _log(f"      [RT] URL: {cur[:140]}")
                     last_url = cur
                     last_log_ts = now
+                if "auth.openai.com/log-in" in cur:
+                    has_password = bool(page.query_selector('input[type="password"]:visible'))
+                    has_otp = bool(
+                        page.query_selector('input[autocomplete="one-time-code"]:visible') or
+                        page.query_selector('input[inputmode="numeric"]:visible')
+                    )
+                    if not has_password and not has_otp:
+                        if login_stuck_since is None:
+                            login_stuck_since = time.time()
+                        if login_retry_count < 3 and time.time() - login_stuck_since > 8 * (login_retry_count + 1):
+                            login_retry_count += 1
+                            _log_auth_page_state(f"log-in 卡住重试 {login_retry_count}/3")
+                            _click_first_visible([
+                                'button[type="submit"]',
+                                'button:has-text("Continue")',
+                                'button:has-text("Next")',
+                                'button:has-text("Log in")',
+                                'button:has-text("Sign in")',
+                                '#btnNext',
+                                '[data-testid*="continue"]',
+                                '[data-testid*="submit"]',
+                            ], f"log-in 继续重试 {login_retry_count}/3")
+                            try:
+                                active = page.query_selector('input[type="email"]:visible, input[name="email"]:visible')
+                                if active:
+                                    active.press("Enter")
+                                    _log(f"      [RT] log-in 继续重试 Enter {login_retry_count}/3")
+                            except Exception:
+                                pass
+                            time.sleep(3)
+                        if time.time() - login_stuck_since > 65:
+                            _safe_screenshot(page, "/tmp/rt_login_stuck.png")
+                            _log("      [RT] log-in 65s 未推进到密码/OTP/callback，提前结束 RT 捕获")
+                            break
+                    else:
+                        login_stuck_since = None
                 # OTP 页
                 if ("/email-otp" in cur or "passwordless" in cur or
                     page.query_selector('input[autocomplete="one-time-code"]') or
@@ -5600,9 +5772,13 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                                     digits[i].click(); time.sleep(0.1); digits[i].fill(ch)
                                 filled = True
                         if filled:
+                            if "/email-verification/register" in page.url:
+                                _fill_email_verification_register_profile()
                             time.sleep(0.5)
-                            for sel in ['button[type="submit"]', 'button:has-text("Continue")',
-                                        'button:has-text("Verify")']:
+                            for sel in ['button:has-text("Continue")',
+                                        'button[data-dd-action-name="Continue"]',
+                                        'button:has-text("Verify")',
+                                        'button[type="submit"]:not([value="resend"])']:
                                 b = page.query_selector(sel)
                                 if b and b.is_visible():
                                     b.click()
@@ -5610,6 +5786,31 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                                     break
                             otp_fetched = True
                             time.sleep(3)
+                    elif "/email-verification/register" in cur and not getattr(page, "_rt_inline_profile_filled", False):
+                        if _fill_email_verification_register_profile():
+                            for sel in ['button:has-text("Continue")',
+                                        'button[data-dd-action-name="Continue"]',
+                                        'button:has-text("Verify")',
+                                        'button[type="submit"]:not([value="resend"])']:
+                                b = page.query_selector(sel)
+                                if b and b.is_visible():
+                                    try:
+                                        b.click()
+                                        _log("      [RT] 合并验证页提交")
+                                        time.sleep(3)
+                                    except Exception as e:
+                                        _log(f"      [RT] 合并验证页提交异常: {e}")
+                                    break
+                    elif "/email-verification" in cur and otp_fetched:
+                        if not getattr(page, "_rt_email_verification_stuck_logged", False):
+                            page._rt_email_verification_stuck_logged = True
+                            _safe_screenshot(page, "/tmp/rt_email_verification_stuck.png")
+                            _log("      [RT] OTP 后仍停留在 email-verification，继续短暂等待跳转")
+                        if getattr(page, "_rt_email_verification_stuck_since", None) is None:
+                            page._rt_email_verification_stuck_since = time.time()
+                        if time.time() - page._rt_email_verification_stuck_since > 45:
+                            _log("      [RT] email-verification 45s 未跳转，提前结束 callback 等待")
+                            break
                 # /about-you 页（偶尔会出现）— 跳过
                 if "/about-you" in cur:
                     for sel in ['button:has-text("Finish")', 'button:has-text("Continue")',
@@ -8410,8 +8611,26 @@ def run(
         for stage_name in sorted(stage_proxy_cfg):
             _log(f"        - {stage_name}: {_describe_proxy_cfg(stage_proxy_cfg.get(stage_name))}")
 
-    with _http_session_stage_proxy(http, stage_proxy_cfg, "fingerprint"):
-        reg_guid, reg_muid, reg_sid = register_fingerprint(http)
+    preseeded_fp = _resolve_preseeded_stripe_fingerprint(cfg)
+    preseeded_user_agent = preseeded_fp.get("user_agent", "") if preseeded_fp else ""
+    if preseeded_fp:
+        if preseeded_user_agent:
+            http.headers.update(
+                _browser_like_session_headers(
+                    locale_profile["browser_locale"],
+                    user_agent=preseeded_user_agent,
+                )
+            )
+        reg_guid = preseeded_fp["guid"]
+        reg_muid = preseeded_fp["muid"]
+        reg_sid = preseeded_fp["sid"]
+        _log(
+            "      [指纹] 复用 pipeline 起始指纹 "
+            f"guid={reg_guid[:20]}... muid={reg_muid[:20]}... sid={reg_sid[:20]}..."
+        )
+    else:
+        with _http_session_stage_proxy(http, stage_proxy_cfg, "fingerprint"):
+            reg_guid, reg_muid, reg_sid = register_fingerprint(http)
 
     effective_checkout_input = checkout_input
     fresh_cfg = cfg.get("fresh_checkout") or {}
@@ -8491,7 +8710,12 @@ def run(
     init_ctx["runtime_version"] = runtime_cfg.get("version") or DEFAULT_STRIPE_RUNTIME_VERSION
     init_ctx["js_checksum"] = runtime_cfg.get("js_checksum", "")
     init_ctx["rv_timestamp"] = runtime_cfg.get("rv_timestamp", "")
-    http.headers.update(_browser_like_session_headers(init_ctx.get("locale") or locale_profile["browser_locale"]))
+    http.headers.update(
+        _browser_like_session_headers(
+            init_ctx.get("locale") or locale_profile["browser_locale"],
+            user_agent=preseeded_user_agent,
+        )
+    )
     init_ctx["top_checkout_config_id"] = (
         runtime_cfg.get("top_checkout_config_id")
         or init_ctx.get("config_id", "")

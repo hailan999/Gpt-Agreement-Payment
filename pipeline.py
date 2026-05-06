@@ -787,7 +787,8 @@ def _cpa_cfg_for_card_payment(card_cfg: dict) -> dict:
 
 def pay(card_config_path, session_token=None, access_token=None,
         device_id=None, use_paypal=False, use_gopay=False,
-        gopay_otp_file=None, python=None, timeout=600):
+        gopay_otp_file=None, python=None, timeout=600,
+        stripe_fingerprint=None):
     """执行 Stripe 支付流程。
 
     use_paypal / use_gopay 互斥：默认 card 路径，paypal 走 PayPal browser，
@@ -805,23 +806,26 @@ def pay(card_config_path, session_token=None, access_token=None,
     # 如果有外部凭证，创建临时配置
     config_to_use = card_config_path
     tmp_config = None
-    if session_token or access_token:
+    if session_token or access_token or stripe_fingerprint:
         with open(card_config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
         cfg_for_env = cfg
-        auth = cfg.setdefault("fresh_checkout", {}).setdefault("auth", {})
-        auth["mode"] = "access_token"
-        if session_token:
-            auth["session_token"] = session_token
-        if access_token:
-            auth["access_token"] = access_token
-        if device_id:
-            auth["device_id"] = device_id
-        auth["prefer_session_refresh"] = True
-        # 禁用 auto_register（凭证已有）
-        auto = auth.get("auto_register", {})
-        auto["enabled"] = False
-        auth["auto_register"] = auto
+        if stripe_fingerprint:
+            cfg["stripe_fingerprint"] = stripe_fingerprint
+        if session_token or access_token:
+            auth = cfg.setdefault("fresh_checkout", {}).setdefault("auth", {})
+            auth["mode"] = "access_token"
+            if session_token:
+                auth["session_token"] = session_token
+            if access_token:
+                auth["access_token"] = access_token
+            if device_id:
+                auth["device_id"] = device_id
+            auth["prefer_session_refresh"] = True
+            # 禁用 auto_register（凭证已有）
+            auto = auth.get("auto_register", {})
+            auto["enabled"] = False
+            auth["auto_register"] = auto
 
         tmp_config = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", prefix="pipeline_pay_",
@@ -898,8 +902,8 @@ def pay(card_config_path, session_token=None, access_token=None,
                     rt_login_hits = 0
                 rt_login_hits += 1
                 if rt_login_hits >= 4 and now - rt_login_first_ts >= 30:
-                    _kill_proc(proc)
-                    raise PaymentError("Codex RT 阶段反复停在 auth.openai.com/log-in，跳过本轮")
+                    print("[pay] 警告: Codex RT 阶段反复停在 auth.openai.com/log-in，继续等待 card.py 自行收尾")
+                    rt_login_hits = -999
             if time.time() > deadline:
                 _kill_proc(proc)
                 raise PaymentError("支付超时")
@@ -955,6 +959,9 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
     if picked_proxy:
         print(f"[ProxyPool] 本次代理: {picked_proxy}")
 
+    # 在完整 pipeline 的最开头预注册 Stripe 指纹，后续支付子进程复用同一组 guid/muid/sid。
+    pipeline_fingerprint = _register_pipeline_start_fingerprint(card_cfg or {}, picked_proxy)
+
     # 挑域 + 写临时 CTF-reg config（同时覆盖 proxy）
     # pool.domains 为空时，若有 provisioner 仍要让 pick() 触发自动开通
     picked_domain = pool.pick() if pool and (pool.domains or pool.provisioner) else ""
@@ -967,16 +974,21 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
             pool.mark_used(picked_domain)
             print(f"[DomainPool] 本次使用域: {picked_domain}")
 
-    # CTF-pay 也覆盖 proxy（支付流程走同一代理）
+    # CTF-pay 也覆盖 proxy（支付流程走同一代理），并注入 pipeline 起始指纹
     temp_card = None
     effective_card = card_config_path
-    if picked_proxy:
-        temp_card = _rewrite_card_with_proxy(card_config_path, picked_proxy)
+    if picked_proxy or pipeline_fingerprint:
+        temp_card = _rewrite_card_with_proxy(
+            card_config_path,
+            picked_proxy,
+            stripe_fingerprint=pipeline_fingerprint,
+        )
         effective_card = temp_card
 
     ts = datetime.now(timezone.utc).isoformat()
     record = {"ts": ts, "registration": {}, "payment": {},
-              "domain": picked_domain, "proxy": picked_proxy}
+              "domain": picked_domain, "proxy": picked_proxy,
+              "stripe_fingerprint": pipeline_fingerprint}
 
     try:
         # Step 1: 注册
@@ -1006,6 +1018,7 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
                 use_gopay=use_gopay,
                 gopay_otp_file=gopay_otp_file,
                 timeout=timeout_pay,
+                stripe_fingerprint=pipeline_fingerprint,
             )
             record["payment"] = {
                 "status": pay_result.get("status", "unknown"),
@@ -1079,7 +1092,10 @@ def _run_one_pay_only(args_tuple):
 def _register_one(args_tuple):
     """单个注册任务。args_tuple = (idx, cardw_config_path, pool_or_None)
     pool 非空时为每个 worker 独立 pick 域 + 改写临时 cardw config。"""
-    if len(args_tuple) == 3:
+    pipeline_fingerprint = {}
+    if len(args_tuple) == 4:
+        idx, cardw_config_path, pool, pipeline_fingerprint = args_tuple
+    elif len(args_tuple) == 3:
         idx, cardw_config_path, pool = args_tuple
     else:
         idx, cardw_config_path = args_tuple
@@ -1094,9 +1110,21 @@ def _register_one(args_tuple):
             temp_cardw = _rewrite_cardw_with_domain(cardw_config_path, picked_domain)
             effective = temp_cardw
         r = register(effective)
-        return {"index": idx, "status": "ok", "picked_domain": picked_domain, **r}
+        return {
+            "index": idx,
+            "status": "ok",
+            "picked_domain": picked_domain,
+            "stripe_fingerprint": pipeline_fingerprint,
+            **r,
+        }
     except Exception as e:
-        return {"index": idx, "status": "error", "picked_domain": picked_domain, "error": str(e)[:200]}
+        return {
+            "index": idx,
+            "status": "error",
+            "picked_domain": picked_domain,
+            "stripe_fingerprint": pipeline_fingerprint,
+            "error": str(e)[:200],
+        }
     finally:
         if temp_cardw and os.path.exists(temp_cardw):
             try: os.unlink(temp_cardw)
@@ -1131,13 +1159,20 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
         ok_count = 0
         for i in range(count):
             print(f"\n{'#'*60}\n# 批次 {i+1}/{count}  (register-only)\n{'#'*60}")
+            pipeline_fingerprint = _register_pipeline_start_fingerprint(card_cfg or {}, "")
             try:
                 r = register(cardw_path)
                 r["batch_index"] = i
+                r["stripe_fingerprint"] = pipeline_fingerprint
                 if r.get("status") == "ok":
                     ok_count += 1
             except Exception as e:
-                r = {"batch_index": i, "status": "error", "error": str(e)[:200]}
+                r = {
+                    "batch_index": i,
+                    "status": "error",
+                    "stripe_fingerprint": pipeline_fingerprint,
+                    "error": str(e)[:200],
+                }
                 print(f"[batch] ✗ 注册异常: {e}")
             results.append(r)
             print(f"[batch] 进度 {i+1}/{count}  累计 ok={ok_count}")
@@ -1154,12 +1189,16 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
         for i in range(count):
             print(f"\n{'#'*60}\n# 批次 {i+1}/{count}  (pay-only)\n{'#'*60}")
             try:
+                pipeline_fingerprint = _register_pipeline_start_fingerprint(card_cfg or {}, "")
                 r = pay_only(
                     card_config_path,
                     use_paypal=use_paypal, use_gopay=use_gopay,
                     gopay_otp_file=gopay_otp_file,
+                    stripe_fingerprint=pipeline_fingerprint,
                 )
                 r["batch_index"] = i
+                if isinstance(r, dict):
+                    r["stripe_fingerprint"] = pipeline_fingerprint
                 if r.get("status") == "succeeded":
                     ok_count += 1
             except Exception as e:
@@ -1198,7 +1237,11 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
         cardw_cfg = cardw_path
 
         print(f"\n[batch] === 阶段 1: 并行注册 ({workers} workers × {count} 账号) ===")
-        reg_tasks = [(i, cardw_cfg, pool) for i in range(count)]
+        batch_fingerprints = [
+            _register_pipeline_start_fingerprint(card_cfg or {}, "")
+            for _ in range(count)
+        ]
+        reg_tasks = [(i, cardw_cfg, pool, batch_fingerprints[i]) for i in range(count)]
         accounts = [None] * count
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(_register_one, t): t[0] for t in reg_tasks}
@@ -1222,6 +1265,7 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
             print(f"\n{'─'*40}")
             print(f"[batch] 支付 {i+1}/{len(reg_ok)}: {acc['email']}")
             picked_domain = acc.get("picked_domain", "")
+            pipeline_fingerprint = acc.get("stripe_fingerprint") or {}
             invite_perm = "-"
             try:
                 pay_result = pay(
@@ -1230,11 +1274,13 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
                     access_token=acc.get("access_token"),
                     device_id=acc.get("device_id", ""),
                     use_paypal=True,
+                    stripe_fingerprint=pipeline_fingerprint,
                 )
                 record = {
                     "registration": {"status": "ok", "email": acc["email"]},
                     "payment": {"status": pay_result.get("status", "unknown"), "email": acc["email"]},
                     "domain": picked_domain,
+                    "stripe_fingerprint": pipeline_fingerprint,
                 }
                 if pay_result.get("status") == "succeeded" and team_client:
                     try:
@@ -1251,6 +1297,7 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
                     "registration": {"status": "ok", "email": acc["email"]},
                     "payment": {"status": "error", "email": acc["email"], "error": str(e)[:200]},
                     "domain": picked_domain,
+                    "stripe_fingerprint": pipeline_fingerprint,
                 }
             record["batch_index"] = i
             _append_result(record)
@@ -1392,7 +1439,8 @@ def _select_recent_registered_account_for_pay_only() -> dict | None:
 
 
 def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
-             gopay_otp_file=None, timeout_pay=600, prefer_recent=True):
+             gopay_otp_file=None, timeout_pay=600, prefer_recent=True,
+             stripe_fingerprint=None):
     """Retry payment only.
 
     Default behavior is now:
@@ -1410,6 +1458,8 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
         card_cfg = _read_card_cfg(card_config_path)
     except Exception:
         card_cfg = {}
+    if stripe_fingerprint is None:
+        stripe_fingerprint = _register_pipeline_start_fingerprint(card_cfg or {}, "")
     if account:
         print(
             "[pay-only] 复用最近未支付注册账号: "
@@ -1428,6 +1478,7 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
         "payment": {},
         "domain": email.split("@", 1)[1] if "@" in email else "",
         "proxy": "",
+        "stripe_fingerprint": stripe_fingerprint or {},
     }
     try:
         result = pay(
@@ -1439,6 +1490,7 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
             use_gopay=use_gopay,
             gopay_otp_file=gopay_otp_file,
             timeout=timeout_pay,
+            stripe_fingerprint=stripe_fingerprint,
         )
         status = result.get("status", "unknown")
         raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
@@ -2591,6 +2643,41 @@ def _build_proxy_pool_from_card_cfg(card_cfg) -> "ProxyPool":
     return ProxyPool(proxies=pp.get("list", []), rotation=pp.get("rotation", "static"))
 
 
+STRIPE_FINGERPRINT_USER_AGENT_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.165 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.177 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.72 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.154 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.177 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.80 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.72 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.177 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.153 Safari/537.36",
+]
+
+
+def _build_proxy_url_from_cfg(proxy_cfg) -> str:
+    if not proxy_cfg:
+        return ""
+    if isinstance(proxy_cfg, str):
+        return proxy_cfg.strip()
+    if not isinstance(proxy_cfg, dict):
+        return ""
+
+    host = str(proxy_cfg.get("host") or "").strip()
+    if not host:
+        return ""
+    port = proxy_cfg.get("port")
+    user = str(proxy_cfg.get("user") or "").strip()
+    pwd = str(proxy_cfg.get("pass") or "").strip()
+
+    if port in (None, ""):
+        return f"http://{host}"
+    if user and pwd:
+        return f"http://{user}:{pwd}@{host}:{port}"
+    return f"http://{host}:{port}"
+
+
 def _rewrite_cardw_with_domain(src_path, domain, proxy_url=""):
     """读 CTF-reg config，把 catch_all_domain 覆盖为 domain，可选覆盖 proxy，写到临时文件返回路径"""
     with open(src_path, "r", encoding="utf-8") as f:
@@ -2608,11 +2695,14 @@ def _rewrite_cardw_with_domain(src_path, domain, proxy_url=""):
     return tmp.name
 
 
-def _rewrite_card_with_proxy(src_path, proxy_url):
-    """读 CTF-pay config，覆盖 proxy 字段，写到临时文件返回路径"""
+def _rewrite_card_with_proxy(src_path, proxy_url="", stripe_fingerprint=None):
+    """读 CTF-pay config，覆盖 pipeline 运行时字段，写到临时文件返回路径"""
     with open(src_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    data["proxy"] = proxy_url
+    if proxy_url:
+        data["proxy"] = proxy_url
+    if stripe_fingerprint:
+        data["stripe_fingerprint"] = stripe_fingerprint
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", prefix="pipeline_pay_px_",
         dir=str(CARD_DIR), delete=False, encoding="utf-8",
@@ -2620,6 +2710,62 @@ def _rewrite_card_with_proxy(src_path, proxy_url):
     json.dump(data, tmp, ensure_ascii=False, indent=2)
     tmp.close()
     return tmp.name
+
+
+def _register_pipeline_start_fingerprint(card_cfg: dict, proxy_url: str = "") -> dict:
+    """Best-effort Stripe fingerprint registration before the full pipeline starts."""
+    try:
+        if str(CARD_DIR) not in sys.path:
+            sys.path.insert(0, str(CARD_DIR))
+        import card as card_mod  # noqa: E402
+        import requests  # noqa: E402
+
+        locale_profile = {}
+        try:
+            country = str(
+                (card_cfg or {}).get("locale")
+                or (card_cfg or {}).get("locale_profile")
+                or (card_cfg or {}).get("country")
+                or "ID"
+            ).upper()
+            locale_profile = (getattr(card_mod, "LOCALE_PROFILES", {}) or {}).get(country) or {}
+        except Exception:
+            locale_profile = {}
+        browser_locale = locale_profile.get("browser_locale") or "en-US"
+        user_agent = random.choice(STRIPE_FINGERPRINT_USER_AGENT_POOL)
+
+        http = requests.Session()
+        try:
+            http.headers.update(card_mod._browser_like_session_headers(browser_locale))
+        except Exception:
+            pass
+        http.headers.update({"User-Agent": user_agent})
+
+        effective_proxy = proxy_url or _build_proxy_url_from_cfg((card_cfg or {}).get("proxy"))
+        if effective_proxy:
+            try:
+                card_mod._apply_proxy_to_http_session(http, effective_proxy)
+            except Exception:
+                http.proxies = {"http": effective_proxy, "https": effective_proxy}
+
+        guid, muid, sid = card_mod.register_fingerprint(http)
+        fp = {
+            "guid": guid,
+            "muid": muid,
+            "sid": sid,
+            "user_agent": user_agent,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source": "pipeline_start",
+        }
+        print(
+            "[pipeline] 起始指纹: "
+            f"guid={guid[:20]}... muid={muid[:20]}... sid={sid[:20]}... "
+            f"ua=Chrome/{user_agent.split('Chrome/', 1)[-1].split(' ', 1)[0]}"
+        )
+        return fp
+    except Exception as e:
+        print(f"[pipeline] 起始指纹生成失败，继续流程: {e}")
+        return {}
 
 
 def _find_latest_refresh_token_for_email(email, session_id=""):

@@ -64,6 +64,15 @@ def _new_session(impersonate: str = "chrome136") -> Any:
     return requests.Session()
 
 
+def _is_curl_tls_library_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        "tls connect error" in text
+        and "invalid library" in text
+        and ("curl" in text or "openssl" in text)
+    )
+
+
 # ──────────────────────────── constants ───────────────────────────
 
 # OpenAI's Midtrans merchant client id (public, embedded in JS).
@@ -148,13 +157,22 @@ class GoPayCharger:
         )
         self.otp_provider = otp_provider
         self.log = log
+        self.proxy = proxy
         # Stripe runtime fingerprint (js_checksum / rv_timestamp / version) — these
         # are computed by Stripe.js client-side; replay the captured values from
         # config.runtime or HAR. Without them confirm 400.
         self.runtime = runtime_cfg or {}
         # separate session for non-chatgpt domains (avoid leaking chatgpt cookies)
-        self.ext = _new_session()
-        self.ext.headers.update({
+        self.ext = self._build_ext_session()
+        if proxy:
+            try:
+                self.cs.proxies = {"http": proxy, "https": proxy}
+            except Exception:
+                pass
+
+    def _build_ext_session(self) -> Any:
+        sess = _new_session()
+        sess.headers.update({
             "User-Agent": (
                 self.cs.headers.get("User-Agent")
                 or "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_2_1) "
@@ -162,15 +180,23 @@ class GoPayCharger:
             ),
             "Accept-Language": "en-US,en;q=0.9",
         })
-        if proxy:
+        if self.proxy:
             try:
-                self.cs.proxies = {"http": proxy, "https": proxy}
+                sess.proxies = {"http": self.proxy, "https": self.proxy}
             except Exception:
                 pass
-            try:
-                self.ext.proxies = {"http": proxy, "https": proxy}
-            except Exception:
-                pass
+        return sess
+
+    def _recover_ext_session_after_tls_error(self, exc: BaseException) -> None:
+        self.log(
+            "[gopay] curl_cffi TLS handshake failed; rebuilding HTTP session and retrying once. "
+            "If it repeats, rebuild the venv or pin a known-good curl_cffi wheel."
+        )
+        try:
+            self.ext.close()
+        except Exception:
+            pass
+        self.ext = self._build_ext_session()
 
     # ───── Step 1-4: ChatGPT/Stripe checkout ─────
 
@@ -549,21 +575,34 @@ class GoPayCharger:
 
     def _tokenize_pin(self, challenge_id: str, client_id: str) -> str:
         """POST customer.gopayapi.com/api/v1/users/pin/tokens/nb → JWT."""
-        r = self.ext.post(
-            "https://customer.gopayapi.com/api/v1/users/pin/tokens/nb",
-            json={"challenge_id": challenge_id, "client_id": client_id, "pin": self.pin},
-            headers={
-                "x-appversion": "1.0.0",
-                "x-correlation-id": str(uuid.uuid4()),
-                "x-is-mobile": "false",
-                "x-platform": "Mac OS 12.2.1",
-                "x-request-id": str(uuid.uuid4()),
-                "x-user-locale": "id",
-                "Origin": "https://pin-web-client.gopayapi.com",
-                "Referer": "https://pin-web-client.gopayapi.com/",
-            },
-            timeout=DEFAULT_TIMEOUT,
-        )
+        url = "https://customer.gopayapi.com/api/v1/users/pin/tokens/nb"
+        payload = {"challenge_id": challenge_id, "client_id": client_id, "pin": self.pin}
+        headers = {
+            "x-appversion": "1.0.0",
+            "x-correlation-id": str(uuid.uuid4()),
+            "x-is-mobile": "false",
+            "x-platform": "Mac OS 12.2.1",
+            "x-request-id": str(uuid.uuid4()),
+            "x-user-locale": "id",
+            "Origin": "https://pin-web-client.gopayapi.com",
+            "Referer": "https://pin-web-client.gopayapi.com/",
+        }
+        try:
+            r = self.ext.post(url, json=payload, headers=headers, timeout=DEFAULT_TIMEOUT)
+        except Exception as exc:
+            if not _is_curl_tls_library_error(exc):
+                raise
+            self._recover_ext_session_after_tls_error(exc)
+            try:
+                r = self.ext.post(url, json=payload, headers=headers, timeout=DEFAULT_TIMEOUT)
+            except Exception as retry_exc:
+                if _is_curl_tls_library_error(retry_exc):
+                    raise GoPayError(
+                        "curl_cffi TLS connect failed twice while tokenizing PIN. "
+                        "Rebuild the virtual environment and reinstall curl_cffi/certifi; "
+                        "also check whether a proxy or endpoint TLS policy changed."
+                    ) from retry_exc
+                raise
         if r.status_code in (400, 401, 403):
             raise GoPayPINRejected(f"PIN rejected: {r.text[:200]}")
         r.raise_for_status()
