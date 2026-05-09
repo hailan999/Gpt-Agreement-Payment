@@ -1459,6 +1459,13 @@ def _current_registered_account_status(account: dict | None) -> str:
         return ""
 
 
+def _preserve_higher_priority_account_status(account: dict | None, next_status: str) -> str:
+    current_status = _current_registered_account_status(account)
+    if current_status == "ADD_PHONE" and str(next_status or "").strip().upper() in {"SUCCESS", "UN_OAUTHED"}:
+        return "ADD_PHONE"
+    return next_status
+
+
 def _select_recent_registered_account_for_pay_only(target_email: str = "") -> dict | None:
     """Pick the newest registered account whose status is INITIAL.
 
@@ -1577,6 +1584,7 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
             record["payment"]["error"] = "total_summary.due is not 0"
         if account_status == "SUCCESS" and _current_registered_account_status(account) == "UN_OAUTHED":
             account_status = "UN_OAUTHED"
+        account_status = _preserve_higher_priority_account_status(account, account_status)
         _mark_registered_account_status(account, account_status)
         cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
         if use_gopay and status != "succeeded":
@@ -1794,12 +1802,44 @@ def _read_card_cfg(path):
         return json.load(f)
 
 
+def _read_json_file(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def _load_cardw_path_from_card_cfg(card_cfg, fallback_cardw=None):
     if fallback_cardw:
         return str(Path(fallback_cardw).resolve())
     p = (card_cfg.get("fresh_checkout", {}).get("auth", {})
                  .get("auto_register", {}).get("config_path", ""))
     return str(Path(p).resolve()) if p else str(CARDW_DIR / "config.noproxy.json")
+
+
+def _merged_mail_cfg_for_rt_backfill(card_cfg: dict, cardw_path: str) -> dict:
+    card_mail = card_cfg.get("mail") if isinstance(card_cfg.get("mail"), dict) else {}
+    cardw_cfg = _read_json_file(cardw_path) if cardw_path else {}
+    cardw_mail = cardw_cfg.get("mail") if isinstance(cardw_cfg.get("mail"), dict) else {}
+    merged = dict(cardw_mail or {})
+    merged.update(card_mail or {})
+    if isinstance(cardw_mail.get("hotmail"), dict) or isinstance(card_mail.get("hotmail"), dict):
+        hotmail = dict(cardw_mail.get("hotmail") or {})
+        hotmail.update(card_mail.get("hotmail") or {})
+        merged["hotmail"] = hotmail
+    return merged
+
+
+def _save_registered_account_refresh_token(account: dict, refresh_token: str) -> None:
+    account_id = account.get("id") if isinstance(account, dict) else None
+    if not account_id or not refresh_token:
+        return
+    try:
+        get_db().update_registered_account_refresh_token(int(account_id), refresh_token)
+    except Exception as e:
+        print(f"[free-backfill] 写回 refresh_token 失败 id={account_id}: {e}")
 
 
 def _load_secrets():
@@ -3282,6 +3322,7 @@ def _cpa_import_after_team(
     *,
     refresh_token: str = "",
     is_free: bool = False,
+    unlink_gopay: bool = True,
 ) -> str:
     """支付成功后把账号导入 CPA (CLIProxyAPI)。best-effort，异常不抛。
 
@@ -3342,7 +3383,8 @@ def _cpa_import_after_team(
         print(f"[CPA] {email} 无 refresh_token，回退使用现有 access_token 裸导入")
         token_path = _save_local_codex_json(email, body, plan_tag)
         print(f"[CPA] {email} 本地 JSON 已保存: {token_path}")
-        _gopay_unlink_after_cpa_json(email, cpa_cfg)
+        if unlink_gopay:
+            _gopay_unlink_after_cpa_json(email, cpa_cfg)
         if local_only:
             return "local_saved"
         tag = hashlib.md5(email.encode()).hexdigest()[:8]
@@ -3437,7 +3479,8 @@ def _cpa_import_after_team(
         if existing:
             token_path = _save_local_codex_json(email, existing, plan_tag)
             print(f"[CPA] {email} 复用已有本地 JSON: {token_path}")
-            _gopay_unlink_after_cpa_json(email, cpa_cfg)
+            if unlink_gopay:
+                _gopay_unlink_after_cpa_json(email, cpa_cfg)
             return "local_saved"
         print(f"[CPA] {email} 未拿到 access_token，跳过本地 JSON 覆盖")
         return "no_json"
@@ -3461,7 +3504,8 @@ def _cpa_import_after_team(
     }
     token_path = _save_local_codex_json(email, body, plan_tag)
     print(f"[CPA] {email} 本地 JSON 已保存: {token_path}")
-    _gopay_unlink_after_cpa_json(email, cpa_cfg)
+    if unlink_gopay:
+        _gopay_unlink_after_cpa_json(email, cpa_cfg)
     if local_only:
         return "local_saved"
     tag = hashlib.md5(email.encode()).hexdigest()[:8]
@@ -3875,16 +3919,17 @@ def free_register_loop(card_config_path, cardw_config_path=None, count: int = 0)
 
 
 def free_backfill_rt_loop(card_config_path, cardw_config_path=None):
-    """free_only mode：读数据库里的注册账号给老号补 rt + 推 CPA(free)。
+    """free_only mode：读数据库里 status=UN_OAUTHED 的账号补 rt + 推 CPA(free)。
 
-    跳过：已有 refresh_token / oauth_status==succeeded / oauth_status==dead /
-    transient_failed 在 6h cooldown 内的账号。
+    跳过：非 UN_OAUTHED / 已有 refresh_token / oauth_status==succeeded /
+    oauth_status==dead / transient_failed 在 6h cooldown 内的账号。
     """
     import hashlib
 
     card_cfg = _read_card_cfg(card_config_path)
+    cardw_path = _load_cardw_path_from_card_cfg(card_cfg, cardw_config_path)
     cpa_cfg = (card_cfg or {}).get("cpa") or {}
-    mail_cfg = card_cfg.get("mail") or {}
+    mail_cfg = _merged_mail_cfg_for_rt_backfill(card_cfg, cardw_path)
     proxy_url = card_cfg.get("proxy", "")
 
     _ensure_gost_alive(card_cfg)
@@ -3901,13 +3946,16 @@ def free_backfill_rt_loop(card_config_path, cardw_config_path=None):
         return
 
     todo = []
-    skip_has_rt = skip_succeeded = skip_dead = skip_cooldown = 0
+    skip_status = skip_has_rt = skip_succeeded = skip_dead = skip_cooldown = 0
     seen_emails = set()
-    for acc in accounts:
+    for acc in reversed(accounts):
         email = (acc.get("email") or "").strip()
         if not email or email.lower() in seen_emails:
             continue
         seen_emails.add(email.lower())
+        if _registered_account_status(acc) != "UN_OAUTHED":
+            skip_status += 1
+            continue
         if acc.get("refresh_token"):
             skip_has_rt += 1
             continue
@@ -3927,7 +3975,7 @@ def free_backfill_rt_loop(card_config_path, cardw_config_path=None):
 
     print(
         f"[free-backfill] 共 {len(accounts)} 账号, todo={len(todo)} "
-        f"(skip: has_rt={skip_has_rt} succeeded={skip_succeeded} "
+        f"(skip: status={skip_status} has_rt={skip_has_rt} succeeded={skip_succeeded} "
         f"dead={skip_dead} cooldown={skip_cooldown})"
     )
 
@@ -3949,13 +3997,17 @@ def free_backfill_rt_loop(card_config_path, cardw_config_path=None):
                 _set_account_oauth_status(email, "transient_failed", "token_exchange_failed")
                 print(f"[free] [{i}/{len(todo)}] backfill {email} → callback_captured code_len={len(rt) - len('oauth_code:')}")
             elif cpa_cfg.get("enabled"):
+                _save_registered_account_refresh_token(acc, rt)
+                _mark_registered_account_status(acc, "SUCCESS")
                 _set_account_oauth_status(email, "succeeded")
                 print(f"[free] [{i}/{len(todo)}] backfill {email} → succeeded rt_len={len(rt)}")
                 cpa_st = _cpa_import_after_team(
-                    email, sid, cpa_cfg, refresh_token=rt, is_free=True,
+                    email, sid, cpa_cfg, refresh_token=rt, is_free=True, unlink_gopay=False,
                 )
                 print(f"[free] [{i}/{len(todo)}] cpa({email}) → {cpa_st}")
             else:
+                _save_registered_account_refresh_token(acc, rt)
+                _mark_registered_account_status(acc, "SUCCESS")
                 _set_account_oauth_status(email, "succeeded")
                 print(f"[free] [{i}/{len(todo)}] backfill {email} → succeeded rt_len={len(rt)}")
             succeeded += 1
@@ -3963,6 +4015,10 @@ def free_backfill_rt_loop(card_config_path, cardw_config_path=None):
             if fail == "account_dead":
                 _set_account_oauth_status(email, "dead", fail)
                 print(f"[free] [{i}/{len(todo)}] backfill {email} → dead ({fail})")
+            elif fail == "add_phone_blocked":
+                _mark_registered_account_status(acc, "ADD_PHONE")
+                _set_account_oauth_status(email, "transient_failed", fail)
+                print(f"[free] [{i}/{len(todo)}] backfill {email} → ADD_PHONE ({fail})")
             else:
                 _set_account_oauth_status(email, "transient_failed", fail)
                 print(f"[free] [{i}/{len(todo)}] backfill {email} → transient_failed ({fail})")

@@ -300,6 +300,131 @@ def test_pay_only_preserves_un_oauthed_after_payment_success(tmp_path, monkeypat
     assert accounts[-1]["status"] == "UN_OAUTHED"
 
 
+def test_free_backfill_rt_uses_latest_un_oauthed_accounts_and_saves_rt(tmp_path, monkeypatch):
+    db = _reset_db(tmp_path, monkeypatch)
+    card_config = tmp_path / "config.paypal.json"
+    cardw_config = tmp_path / "config.paypal-proxy.json"
+    card_config.write_text(json.dumps({"cpa": {"enabled": True}}), encoding="utf-8")
+    cardw_config.write_text(json.dumps({
+        "mail": {
+            "hotmail": {
+                "client_id": "client-from-cardw",
+                "refresh_token": "rt-from-cardw",
+            },
+        },
+    }), encoding="utf-8")
+
+    db.add_registered_account({
+        "email": "old@example.com",
+        "password": "pw-old",
+        "status": "UN_OAUTHED",
+    })
+    db.add_registered_account({
+        "email": "old@example.com",
+        "password": "pw-new",
+        "status": "SUCCESS",
+    })
+    db.add_registered_account({
+        "email": "initial@example.com",
+        "password": "pw-initial",
+        "status": "INITIAL",
+    })
+    db.add_registered_account({
+        "email": "needs@hotmail.com",
+        "password": "pw-hot",
+        "status": "UN_OAUTHED",
+        "hot_client": "client-from-db",
+        "hot_rt": "hotmail-rt-from-db",
+    })
+
+    calls = []
+    cpa_calls = []
+
+    def fake_exchange(email, password, mail_cfg, proxy_url):
+        calls.append((email, password, mail_cfg, proxy_url))
+        assert mail_cfg["hotmail"]["client_id"] == "client-from-cardw"
+        return "codex-refresh-token", ""
+
+    monkeypatch.setattr(pipeline, "_ensure_gost_alive", lambda cfg: None)
+    monkeypatch.setattr(pipeline, "_exchange_rt_with_classification", fake_exchange)
+    monkeypatch.setattr(
+        pipeline,
+        "_cpa_import_after_team",
+        lambda *args, **kwargs: cpa_calls.append((args, kwargs)) or "ok",
+    )
+    monkeypatch.setattr(pipeline.time, "sleep", lambda *_args, **_kwargs: None)
+
+    pipeline.free_backfill_rt_loop(str(card_config), cardw_config_path=str(cardw_config))
+
+    assert [call[0] for call in calls] == ["needs@hotmail.com"]
+    account = get_db().find_latest_registered_account("needs@hotmail.com")
+    assert account["refresh_token"] == "codex-refresh-token"
+    assert account["status"] == "SUCCESS"
+    assert get_db().load_oauth_status_map()["needs@hotmail.com"]["status"] == "succeeded"
+    assert cpa_calls
+    assert cpa_calls[0][1]["unlink_gopay"] is False
+
+
+def test_free_backfill_rt_marks_add_phone_status(tmp_path, monkeypatch):
+    db = _reset_db(tmp_path, monkeypatch)
+    card_config = tmp_path / "config.paypal.json"
+    card_config.write_text(json.dumps({"cpa": {"enabled": False}}), encoding="utf-8")
+
+    db.add_registered_account({
+        "email": "phone-required@hotmail.com",
+        "password": "pw-hot",
+        "status": "UN_OAUTHED",
+    })
+
+    monkeypatch.setattr(pipeline, "_ensure_gost_alive", lambda cfg: None)
+    monkeypatch.setattr(
+        pipeline,
+        "_exchange_rt_with_classification",
+        lambda *args, **kwargs: ("", "add_phone_blocked"),
+    )
+    monkeypatch.setattr(pipeline.time, "sleep", lambda *_args, **_kwargs: None)
+
+    pipeline.free_backfill_rt_loop(str(card_config))
+
+    account = get_db().find_latest_registered_account("phone-required@hotmail.com")
+    assert account["status"] == "ADD_PHONE"
+    oauth = get_db().load_oauth_status_map()["phone-required@hotmail.com"]
+    assert oauth["status"] == "transient_failed"
+    assert oauth["fail_reason"] == "add_phone_blocked"
+
+
+def test_pay_only_preserves_add_phone_over_success(tmp_path, monkeypatch):
+    db = _reset_db(tmp_path, monkeypatch)
+    card_config = tmp_path / "config.paypal.json"
+    card_config.write_text("{}", encoding="utf-8")
+
+    db.add_registered_account({
+        "email": "add-phone@example.com",
+        "session_token": "sess-phone",
+        "access_token": "at-phone",
+        "status": "INITIAL",
+    })
+
+    def fake_pay(*args, **kwargs):
+        row = get_db().find_latest_registered_account("add-phone@example.com")
+        get_db().update_registered_account_status(row["id"], "ADD_PHONE")
+        return {
+            "status": "succeeded",
+            "raw": {
+                "session_id": "cs_test",
+                "chatgpt_email": "add-phone@example.com",
+            },
+        }
+
+    monkeypatch.setattr(pipeline, "pay", fake_pay)
+
+    result = pipeline.pay_only(str(card_config))
+
+    assert result["status"] == "succeeded"
+    account = get_db().find_latest_registered_account("add-phone@example.com")
+    assert account["status"] == "ADD_PHONE"
+
+
 def test_batch_full_pipeline_preserves_gopay_flag(monkeypatch):
     calls = []
 

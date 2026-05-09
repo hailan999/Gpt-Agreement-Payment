@@ -6119,6 +6119,11 @@ def _mark_registered_account_status_by_email(email_addr: str, status: str, reaso
         if not account_id:
             _log(f"      [RT] 无 registered_accounts 记录可标记: {target}")
             return False
+        current_status = str(row.get("status") or "").strip().upper()
+        next_status = str(status or "").strip().upper()
+        if current_status == "ADD_PHONE" and next_status == "UN_OAUTHED":
+            _log(f"      [RT] registered_accounts id={account_id} 保持 ADD_PHONE，跳过 UN_OAUTHED 覆盖")
+            return True
         ok = get_db().update_registered_account_status(int(account_id), status)
         if ok:
             suffix = f" ({reason})" if reason else ""
@@ -6733,6 +6738,11 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                     if not skipped and not getattr(page, "_addphone_gaveup", False):
                         page._addphone_gaveup = True
                         _log("      [RT] add-phone 找不到 Skip 按钮，提前放弃避免 240s 空等")
+                        _mark_registered_account_status_by_email(
+                            email,
+                            "ADD_PHONE",
+                            "final add-phone required",
+                        )
                         break
                 # Codex consent 授权页 — 自动点 Authorize
                 if "/consent" in cur or "/authorize" in cur:

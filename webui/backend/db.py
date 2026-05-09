@@ -356,6 +356,17 @@ class Database:
             )
         return cur.rowcount > 0
 
+    def update_registered_account_refresh_token(self, account_id: int, refresh_token: str) -> bool:
+        refresh_token = _text(refresh_token)
+        if not refresh_token:
+            return False
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE registered_accounts SET refresh_token = ? WHERE id = ?",
+                (refresh_token, int(account_id)),
+            )
+        return cur.rowcount > 0
+
     def update_registered_account_hotmail_refresh_token(self, email: str, refresh_token: str) -> bool:
         target = _email(email)
         refresh_token = _text(refresh_token)
