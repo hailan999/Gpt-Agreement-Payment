@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -57,9 +58,10 @@ def resolve_path(path: str | Path) -> Path:
 
 
 class ADBSession:
-    def __init__(self, adb_path: str = "adb", device: str = ""):
+    def __init__(self, adb_path: str = "adb", device: str = "", timeout_s: float = 15.0):
         self.adb_path = adb_path
         self.device = device.strip()
+        self.timeout_s = max(1.0, float(timeout_s or 15.0))
         self._screen_size: tuple[int, int] | None = None
 
     def cmd(self, *args: str, text: bool = True, check: bool = True) -> subprocess.CompletedProcess:
@@ -73,9 +75,14 @@ class ADBSession:
                 check=check,
                 capture_output=True,
                 text=text,
+                timeout=self.timeout_s,
             )
         except FileNotFoundError as exc:
             raise ADBError(f"ADB not found: {self.adb_path}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise ADBError(
+                f"ADB command timed out after {self.timeout_s:.0f}s: {' '.join(command)}"
+            ) from exc
         except subprocess.CalledProcessError as exc:
             stderr = exc.stderr if isinstance(exc.stderr, str) else ""
             stdout = exc.stdout if isinstance(exc.stdout, str) else ""
@@ -89,9 +96,12 @@ class ADBSession:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=self.timeout_s,
             )
         except FileNotFoundError as exc:
             raise ADBError(f"ADB not found: {self.adb_path}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise ADBError(f"ADB command timed out after {self.timeout_s:.0f}s: {self.adb_path} devices -l") from exc
         except subprocess.CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
             raise ADBError(f"ADB command failed: {self.adb_path} devices -l\n{detail}") from exc
@@ -138,6 +148,11 @@ class ADBSession:
         path.write_bytes(result.stdout)
         return path
 
+    def dump_ui(self) -> str:
+        self.cmd("shell", "uiautomator", "dump", "/sdcard/window.xml")
+        result = self.cmd("shell", "cat", "/sdcard/window.xml")
+        return result.stdout or ""
+
 
 def timestamped_name(prefix: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", prefix).strip("_") or "screen"
@@ -168,6 +183,72 @@ def tap_named(session: ADBSession, config: dict[str, Any], name: str) -> tuple[i
 def screenshot_path(config: dict[str, Any], name: str) -> Path:
     out_dir = resolve_path(config.get("screenshot_dir", "output/gopay_adb_screenshots"))
     return out_dir / timestamped_name(name)
+
+
+def _node_text(node: ET.Element) -> str:
+    return " ".join(
+        str(node.attrib.get(name, "") or "")
+        for name in ("text", "content-desc", "resource-id")
+    ).strip()
+
+
+def _text_matches(haystack: str, patterns: list[str]) -> bool:
+    lowered = haystack.lower()
+    return any(str(pattern).lower() in lowered for pattern in patterns if str(pattern).strip())
+
+
+def ui_has_text(session: ADBSession, patterns: str | list[str]) -> bool:
+    wanted = [patterns] if isinstance(patterns, str) else list(patterns or [])
+    xml_text = session.dump_ui()
+    if _text_matches(xml_text, wanted):
+        return True
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return False
+    return any(_text_matches(_node_text(node), wanted) for node in root.iter())
+
+
+def tap_text(session: ADBSession, patterns: str | list[str]) -> tuple[int, int] | None:
+    wanted = [patterns] if isinstance(patterns, str) else list(patterns or [])
+    xml_text = session.dump_ui()
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise ADBError(f"Could not parse UI dump: {exc}") from exc
+    for node in root.iter():
+        if not _text_matches(_node_text(node), wanted):
+            continue
+        bounds = str(node.attrib.get("bounds", ""))
+        match = re.search(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+        if not match:
+            continue
+        left, top, right, bottom = map(int, match.groups())
+        x = (left + right) // 2
+        y = (top + bottom) // 2
+        session.tap(x, y)
+        return x, y
+    return None
+
+
+def ui_has_top_title(session: ADBSession, patterns: str | list[str]) -> bool:
+    wanted = [patterns] if isinstance(patterns, str) else list(patterns or [])
+    xml_text = session.dump_ui()
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return False
+    for node in root.iter():
+        if not _text_matches(_node_text(node), wanted):
+            continue
+        bounds = str(node.attrib.get("bounds", ""))
+        match = re.search(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+        if not match:
+            continue
+        _left, top, _right, bottom = map(int, match.groups())
+        if top <= 260 and bottom <= 320:
+            return True
+    return False
 
 
 def run_flow(
@@ -208,6 +289,55 @@ def run_flow(
             print(f"{index}. screenshot -> {path}")
             if execute:
                 session.screenshot(path)
+        elif "tap_text_if_present" in step:
+            patterns = step["tap_text_if_present"]
+            repeat = max(1, int(step.get("repeat", 1)))
+            wait_s = float(step.get("wait_after", config.get("default_wait_seconds", 1.2)))
+            print(f"{index}. tap text if present: {patterns} repeat={repeat}")
+            if execute:
+                for attempt in range(1, repeat + 1):
+                    tapped = tap_text(session, patterns)
+                    if not tapped:
+                        print(f"   not present on attempt {attempt}")
+                        break
+                    print(f"   tapped at {tapped[0]},{tapped[1]} on attempt {attempt}")
+                    time.sleep(wait_s)
+        elif "tap_if_text_present" in step:
+            name = step["tap_if_text_present"]
+            patterns = step.get("text") or []
+            wait_s = float(step.get("wait_after", 0.0))
+            coord = get_coord(config, name)
+            print(f"{index}. tap {name} if text present {patterns}: {coord}")
+            if execute:
+                if ui_has_text(session, patterns):
+                    x, y = tap_named(session, config, name)
+                    print(f"   tapped at {x},{y}")
+                    if wait_s > 0:
+                        time.sleep(wait_s)
+                else:
+                    print("   skipped because text is not present")
+        elif "back_if_title_present" in step:
+            patterns = step["back_if_title_present"]
+            wait_s = float(step.get("wait_after", config.get("default_wait_seconds", 1.2)))
+            print(f"{index}. back if top title present: {patterns}")
+            if execute:
+                if ui_has_top_title(session, patterns):
+                    session.back()
+                    print("   back")
+                    if wait_s > 0:
+                        time.sleep(wait_s)
+                else:
+                    print("   skipped because title is not present")
+        elif "fail_if_text" in step:
+            patterns = step["fail_if_text"]
+            print(f"{index}. fail if text present: {patterns}")
+            if execute and ui_has_text(session, patterns):
+                raise ADBError(f"Unexpected screen text present: {patterns}")
+        elif "fail_unless_text" in step:
+            patterns = step["fail_unless_text"]
+            print(f"{index}. fail unless text present: {patterns}")
+            if execute and not ui_has_text(session, patterns):
+                raise ADBError(f"Expected screen text not present: {patterns}")
         elif "back" in step:
             print(f"{index}. back")
             if execute:
@@ -234,6 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", default="", help="ADB device id, overriding config.device.")
     parser.add_argument("--adb", default="", help="ADB executable path, overriding config.adb_path.")
+    parser.add_argument("--adb-timeout", type=float, default=0.0, help="Per-command ADB timeout in seconds.")
     parser.add_argument(
         "--set-ratio",
         action="append",
@@ -280,6 +411,7 @@ def main(argv: list[str] | None = None) -> int:
     session = ADBSession(
         adb_path=args.adb or config.get("adb_path", "adb"),
         device=args.device or config.get("device", ""),
+        timeout_s=args.adb_timeout or float(config.get("adb_timeout_s", 15.0) or 15.0),
     )
 
     try:

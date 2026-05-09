@@ -124,6 +124,180 @@ def test_pay_only_success_imports_cpa_with_plus_tag(tmp_path, monkeypatch):
     assert cpa_cfg["plan_tag"] == "plus"
     rows = get_db().iter_pipeline_results()
     assert rows[-1]["cpa_import"] == "ok"
+    accounts = get_db().iter_registered_accounts()
+    assert accounts[-1]["status"] == "SUCCESS"
+
+
+def test_pay_only_selects_only_initial_accounts(tmp_path, monkeypatch):
+    db = _reset_db(tmp_path, monkeypatch)
+
+    db.add_registered_account({
+        "email": "failed@example.com",
+        "session_token": "sess-failed",
+        "access_token": "at-failed",
+        "status": "FAILED",
+    })
+    db.add_registered_account({
+        "email": "initial@example.com",
+        "session_token": "sess-initial",
+        "access_token": "at-initial",
+        "status": "INITIAL",
+    })
+
+    selected = pipeline._select_recent_registered_account_for_pay_only()
+
+    assert selected is not None
+    assert selected["email"] == "initial@example.com"
+
+
+def test_pay_only_ignores_cardholder_email_when_selecting_account(tmp_path, monkeypatch):
+    db = _reset_db(tmp_path, monkeypatch)
+    card_config = tmp_path / "config.paypal.json"
+    card_config.write_text(json.dumps({
+        "cards": [{"email": "cardholder@example.com"}],
+    }), encoding="utf-8")
+
+    db.add_registered_account({
+        "email": "initial@example.com",
+        "session_token": "sess-initial",
+        "access_token": "at-initial",
+        "status": "INITIAL",
+    })
+
+    calls = []
+
+    def fake_pay(*args, **kwargs):
+        calls.append(kwargs)
+        return {
+            "status": "succeeded",
+            "raw": {
+                "session_id": "cs_test",
+                "chatgpt_email": "initial@example.com",
+            },
+        }
+
+    monkeypatch.setattr(pipeline, "pay", fake_pay)
+
+    result = pipeline.pay_only(str(card_config))
+
+    assert result["status"] == "succeeded"
+    assert calls[0]["session_token"] == "sess-initial"
+    assert calls[0]["access_token"] == "at-initial"
+
+
+def test_pay_only_prefers_registered_account_proxy(tmp_path, monkeypatch):
+    db = _reset_db(tmp_path, monkeypatch)
+    card_config = tmp_path / "config.paypal.json"
+    card_config.write_text(json.dumps({
+        "proxy": "http://config-user:config-pass@proxy.example:80",
+        "proxies": {
+            "enabled": True,
+            "rotation": "random",
+            "list": ["http://pool-user:pool-pass@proxy.example:80"],
+        },
+    }), encoding="utf-8")
+
+    account_proxy = "http://acct-user:acct-pass@proxy.example:80"
+    db.add_registered_account({
+        "email": "initial@example.com",
+        "session_token": "sess-initial",
+        "access_token": "at-initial",
+        "proxy_add": account_proxy,
+        "status": "INITIAL",
+    })
+
+    pay_config_paths = []
+
+    def fake_fingerprint(card_cfg, proxy_url=""):
+        assert proxy_url == account_proxy
+        return {"proxy": proxy_url}
+
+    def fake_pay(card_config_path, **kwargs):
+        pay_config_paths.append(card_config_path)
+        used_cfg = json.loads(open(card_config_path, encoding="utf-8").read())
+        assert used_cfg["proxy"] == account_proxy
+        return {
+            "status": "succeeded",
+            "raw": {
+                "session_id": "cs_test",
+                "chatgpt_email": "initial@example.com",
+            },
+        }
+
+    monkeypatch.setattr(pipeline, "_register_pipeline_start_fingerprint", fake_fingerprint)
+    monkeypatch.setattr(pipeline, "pay", fake_pay)
+
+    result = pipeline.pay_only(str(card_config), proxy_url="http://random-user:random-pass@proxy.example:80")
+
+    assert result["status"] == "succeeded"
+    assert result["proxy"] == account_proxy
+    assert result["stripe_fingerprint"] == {"proxy": account_proxy}
+    assert pay_config_paths
+
+
+def test_pay_only_marks_no_trial_when_due_nonzero(tmp_path, monkeypatch):
+    db = _reset_db(tmp_path, monkeypatch)
+    card_config = tmp_path / "config.paypal.json"
+    card_config.write_text("{}", encoding="utf-8")
+
+    db.add_registered_account({
+        "email": "trial@example.com",
+        "session_token": "sess-trial",
+        "access_token": "at-trial",
+        "status": "INITIAL",
+    })
+
+    def fake_pay(*args, **kwargs):
+        return {
+            "status": "no_trial",
+            "raw": {
+                "chatgpt_email": "trial@example.com",
+                "total_summary": {"due": 34900000, "subtotal": 34900000, "total": 34900000},
+            },
+        }
+
+    monkeypatch.setattr(pipeline, "pay", fake_pay)
+
+    result = pipeline.pay_only(str(card_config))
+
+    assert result["status"] == "no_trial"
+    accounts = get_db().iter_registered_accounts()
+    assert accounts[-1]["status"] == "NO_TRIAL"
+    rows = get_db().iter_pipeline_results()
+    assert rows[-1]["payment"]["status"] == "no_trial"
+    assert rows[-1]["payment"]["error"] == "total_summary.due is not 0"
+
+
+def test_pay_only_preserves_un_oauthed_after_payment_success(tmp_path, monkeypatch):
+    db = _reset_db(tmp_path, monkeypatch)
+    card_config = tmp_path / "config.paypal.json"
+    card_config.write_text("{}", encoding="utf-8")
+
+    db.add_registered_account({
+        "email": "oauth-failed@example.com",
+        "session_token": "sess-oauth",
+        "access_token": "at-oauth",
+        "status": "INITIAL",
+    })
+
+    def fake_pay(*args, **kwargs):
+        row = get_db().find_latest_registered_account("oauth-failed@example.com")
+        get_db().update_registered_account_status(row["id"], "UN_OAUTHED")
+        return {
+            "status": "succeeded",
+            "raw": {
+                "session_id": "cs_test",
+                "chatgpt_email": "oauth-failed@example.com",
+            },
+        }
+
+    monkeypatch.setattr(pipeline, "pay", fake_pay)
+
+    result = pipeline.pay_only(str(card_config))
+
+    assert result["status"] == "succeeded"
+    accounts = get_db().iter_registered_accounts()
+    assert accounts[-1]["status"] == "UN_OAUTHED"
 
 
 def test_batch_full_pipeline_preserves_gopay_flag(monkeypatch):

@@ -5,6 +5,22 @@
     "catch_all_domains": [
       "subdomain.example.com"
     ],
+    "hotmail": {
+      "enabled": false,
+      "client_id": "YOUR_MICROSOFT_CLIENT_ID",
+      "refresh_token": "YOUR_HOTMAIL_REFRESH_TOKEN",
+      "mailboxes": [
+        "INBOX",
+        "Junk"
+      ],
+      "accounts": [
+        {
+          "email": "account@hotmail.com",
+          "clientId": "YOUR_MICROSOFT_CLIENT_ID",
+          "refreshToken": "YOUR_HOTMAIL_REFRESH_TOKEN"
+        }
+      ]
+    },
     "auto_provision": {
       "enabled": false,
       "zone_name": "example.com",

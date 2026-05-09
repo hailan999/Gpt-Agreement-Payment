@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
 import random
@@ -60,7 +61,12 @@ except ImportError:
 def _new_session(impersonate: str = "chrome136") -> Any:
     """Build session with chrome TLS fingerprint when available."""
     if _CurlCffiSession is not None:
-        return _CurlCffiSession(impersonate=impersonate)
+        try:
+            return _CurlCffiSession(impersonate=impersonate)
+        except Exception as exc:
+            if "not supported" not in str(exc).lower() or impersonate == "chrome146":
+                raise
+            return _CurlCffiSession(impersonate="chrome146")
     return requests.Session()
 
 
@@ -92,10 +98,33 @@ GOPAY_PIN_CLIENT_ID_CHARGE = "47180a8e-f56e-11ed-a05b-0242ac120003-GWC"
 DEFAULT_TIMEOUT = 30
 LINK_RETRY_LIMIT = 2  # 406 "account already linked" retry
 LINK_RETRY_SLEEP_S = 12.0  # Midtrans 需要冷却 ~10s 才会让 406 → 201（实测）
-LINK_RATE_LIMIT_RETRY_LIMIT = 4
-LINK_RATE_LIMIT_SLEEP_S = 10.0
-LINK_RATE_LIMIT_JITTER_S = 1.0
+LINK_RATE_LIMIT_RETRY_LIMIT = 12
+LINK_RATE_LIMIT_SLEEP_S = 5.0
+LINK_RATE_LIMIT_JITTER_S = 0.0
 DEFAULT_OTP_REGEX = r"(?<!\d)(\d{6})(?!\d)"
+DEFAULT_CHATGPT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+)
+DEFAULT_USER_AGENTS = [
+    DEFAULT_CHATGPT_USER_AGENT,
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_1) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+    ),
+]
 
 
 # ──────────────────────────── exceptions ──────────────────────────
@@ -114,6 +143,108 @@ class GoPayPINRejected(GoPayError):
 
 
 # ──────────────────────────── core ────────────────────────────────
+
+
+def _chrome_major_from_ua(user_agent: str) -> str:
+    m = re.search(r"(?:Chrome|CriOS)/(\d+)", user_agent or "")
+    return m.group(1) if m else "146"
+
+
+def _curl_impersonate_for_user_agent(user_agent: str) -> str:
+    major = _chrome_major_from_ua(user_agent)
+    # Keep this capped to versions supported by the bundled curl_cffi/libcurl.
+    # Some builds accept Session(impersonate="chrome147") but fail on request.
+    if major not in {"136", "142", "145", "146"}:
+        return "chrome146"
+    return f"chrome{major}"
+
+
+def _sec_ch_ua_for_user_agent(user_agent: str) -> str:
+    major = _chrome_major_from_ua(user_agent)
+    return f'"Google Chrome";v="{major}", "Not.A/Brand";v="8", "Chromium";v="{major}"'
+
+
+def _sec_ch_platform_for_user_agent(user_agent: str) -> str:
+    ua = user_agent or ""
+    if "Macintosh" in ua or "Mac OS X" in ua:
+        return '"macOS"'
+    if "Linux" in ua and "Android" not in ua:
+        return '"Linux"'
+    return '"Windows"'
+
+
+def _ua_cache_path() -> Path:
+    repo_dir = Path(__file__).resolve().parents[1]
+    out_dir = repo_dir / "output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / "user_agent_cache.json"
+
+
+def _rotation_seconds(rotation: dict) -> float:
+    base = float(rotation.get("min_interval_s", rotation.get("cooldown_s", 3600)) or 0)
+    jitter = rotation.get("jitter_s", [0, 900])
+    if isinstance(jitter, (int, float)):
+        return max(0.0, base + random.uniform(0, float(jitter)))
+    if isinstance(jitter, list) and len(jitter) >= 2:
+        lo = float(jitter[0] or 0)
+        hi = float(jitter[1] or 0)
+        if hi < lo:
+            lo, hi = hi, lo
+        return max(0.0, base + random.uniform(lo, hi))
+    return max(0.0, base)
+
+
+def _pick_sticky_user_agent(pool: list[str], rotation: dict, cache_key: str) -> str:
+    rotation = rotation or {}
+    if rotation.get("enabled", True) is False:
+        return random.choice(pool)
+
+    now = time.time()
+    key_src = f"ctf-pay-gopay|{rotation.get('scope', 'config')}|{cache_key}|{'|'.join(pool)}"
+    key = hashlib.sha256(key_src.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    cache_path = _ua_cache_path()
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        if not isinstance(cache, dict):
+            cache = {}
+    except Exception:
+        cache = {}
+
+    entry = cache.get(key) if isinstance(cache.get(key), dict) else {}
+    cached_ua = str(entry.get("user_agent") or "").strip()
+    expires_at = float(entry.get("expires_at") or 0)
+    if cached_ua in pool and expires_at > now:
+        return cached_ua
+
+    candidates = [ua for ua in pool if ua != cached_ua] or pool
+    selected = random.choice(candidates)
+    cache[key] = {
+        "user_agent": selected,
+        "expires_at": now + _rotation_seconds(rotation),
+        "updated_at": now,
+    }
+    try:
+        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return selected
+
+
+def _select_config_user_agent(cfg: dict) -> str:
+    fresh_auth = (cfg.get("fresh_checkout") or {}).get("auth") or {}
+    explicit = str(cfg.get("user_agent") or fresh_auth.get("user_agent") or "").strip()
+    if explicit:
+        return explicit
+
+    configured_pool = cfg.get("user_agents") or fresh_auth.get("user_agents") or DEFAULT_USER_AGENTS
+    pool = [str(x).strip() for x in configured_pool if str(x).strip()]
+    if not pool:
+        pool = DEFAULT_USER_AGENTS
+    return _pick_sticky_user_agent(
+        pool=pool,
+        rotation=cfg.get("user_agent_rotation") or fresh_auth.get("user_agent_rotation") or {},
+        cache_key=str(cfg.get("_loaded_from") or "ctf-pay-gopay"),
+    )
 
 
 class GoPayCharger:
@@ -136,6 +267,7 @@ class GoPayCharger:
         log: Callable[[str], None] = print,
         proxy: Optional[str] = None,
         runtime_cfg: Optional[dict] = None,
+        unlink_cfg: Optional[dict] = None,
     ):
         self.cs = chatgpt_session
         self.country_code = str(gopay_cfg["country_code"]).lstrip("+")
@@ -155,6 +287,12 @@ class GoPayCharger:
         self.link_rate_limit_jitter_s = float(
             gopay_cfg.get("link_rate_limit_jitter_s") or LINK_RATE_LIMIT_JITTER_S
         )
+        self.unlink_cfg = dict(unlink_cfg or {})
+        self.after_406_unlink_sleep_s = float(
+            self.unlink_cfg.get("after_406_unlink_sleep_s")
+            or self.unlink_cfg.get("after_unlink_sleep_s")
+            or 2.0
+        )
         self.otp_provider = otp_provider
         self.log = log
         self.proxy = proxy
@@ -163,6 +301,11 @@ class GoPayCharger:
         # config.runtime or HAR. Without them confirm 400.
         self.runtime = runtime_cfg or {}
         # separate session for non-chatgpt domains (avoid leaking chatgpt cookies)
+        self.ext_user_agent = (
+            self.cs.headers.get("User-Agent")
+            or "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_2_1) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+        )
         self.ext = self._build_ext_session()
         if proxy:
             try:
@@ -171,13 +314,9 @@ class GoPayCharger:
                 pass
 
     def _build_ext_session(self) -> Any:
-        sess = _new_session()
+        sess = _new_session(_curl_impersonate_for_user_agent(self.ext_user_agent))
         sess.headers.update({
-            "User-Agent": (
-                self.cs.headers.get("User-Agent")
-                or "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_2_1) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": self.ext_user_agent,
             "Accept-Language": "en-US,en;q=0.9",
         })
         if self.proxy:
@@ -487,14 +626,88 @@ class GoPayCharger:
                 conflict_hits += 1
                 if conflict_hits > self.link_retry_limit:
                     break
-                self.log(
-                    f"[gopay] midtrans linking 406 ({last_err}), "
-                    f"冷却 {self.link_retry_sleep_s:.0f}s 再重试 "
-                    f"{conflict_hits}/{self.link_retry_limit}"
+                unlinked = _run_configured_gopay_unlink(
+                    self.unlink_cfg,
+                    log=self.log,
+                    reason=str(last_err or "account already linked"),
                 )
-                time.sleep(self.link_retry_sleep_s)
+                wait_s = self.after_406_unlink_sleep_s if unlinked else self.link_retry_sleep_s
+                if unlinked:
+                    self.log(
+                        f"[gopay] midtrans linking 406 ({last_err}), "
+                        f"已确认解绑，冷却 {wait_s:.0f}s 再重试 "
+                        f"{conflict_hits}/{self.link_retry_limit}"
+                    )
+                else:
+                    self.log(
+                        f"[gopay] midtrans linking 406 ({last_err}), "
+                        f"ADB unlink 未确认，冷却 {wait_s:.0f}s 再重试 "
+                        f"{conflict_hits}/{self.link_retry_limit}"
+                    )
+                time.sleep(max(0.0, wait_s))
                 continue
             if r.status_code == 429:
+                self.log(f"[gopay] midtrans linking 429 rate limited, 尝试利用免授权 POST 绕过...")
+                
+                # --- 开始执行修正后的绕过逻辑 ---
+                # 按照截图指示：使用 POST 方法，携带原请求体 (body)，清空请求头
+                # 注意：代码里发 JSON 时，最基础的 Content-Type 必须保留，否则服务器无法解析 Body
+                workaround_headers = {
+                    "Content-Type": "application/json"
+                }
+                try:
+                    # 改用 POST，携带原有的 body，使用精简后的 workaround_headers
+                    r_workaround = self.ext.post(url, json=body, headers=workaround_headers, timeout=DEFAULT_TIMEOUT)
+                    if r_workaround.status_code == 201:
+                        data_workaround = r_workaround.json()
+                        m = re.search(r"reference=([a-f0-9-]{36})", data_workaround.get("activation_link_url", ""))
+                        if m:
+                            ref = m.group(1)
+                            self.log(f"[gopay] 免授权 POST 绕过成功！成功获取 reference={ref}")
+                            return ref
+                        else:
+                            self.log("[gopay] 免授权 POST 绕过返回了 201，但未找到 reference，回退到普通重试。")
+                    elif r_workaround.status_code == 406:
+                        try:
+                            j = r_workaround.json()
+                        except Exception:
+                            j = None
+                        if isinstance(j, dict):
+                            last_err = (j.get("error_messages") or ["?"])[0]
+                        elif isinstance(j, list) and j:
+                            last_err = str(j[0])
+                        else:
+                            last_err = r_workaround.text[:120] or "account already linked"
+                        conflict_hits += 1
+                        if conflict_hits > self.link_retry_limit:
+                            break
+                        unlinked = _run_configured_gopay_unlink(
+                            self.unlink_cfg,
+                            log=self.log,
+                            reason=str(last_err or "account already linked"),
+                        )
+                        wait_s = self.after_406_unlink_sleep_s if unlinked else self.link_retry_sleep_s
+                        if unlinked:
+                            self.log(
+                                f"[gopay] 免授权 POST 返回 406 ({last_err}), "
+                                f"已确认解绑，冷却 {wait_s:.0f}s 再重试 "
+                                f"{conflict_hits}/{self.link_retry_limit}"
+                            )
+                        else:
+                            self.log(
+                                f"[gopay] 免授权 POST 返回 406 ({last_err}), "
+                                f"ADB unlink 未确认，冷却 {wait_s:.0f}s 再重试 "
+                                f"{conflict_hits}/{self.link_retry_limit}"
+                            )
+                        time.sleep(max(0.0, wait_s))
+                        continue
+                    else:
+                        self.log(f"[gopay] 免授权 POST 绕过失败: 状态码 {r_workaround.status_code}，回退到普通重试。")
+                except Exception as e:
+                    self.log(f"[gopay] 免授权 POST 绕过发生异常: {e}")
+                # --- 绕过逻辑结束 ---
+
+                # 如果绕过失败，继续执行原有的 Rate Limit 冷却重试逻辑
                 rate_limit_hits += 1
                 if rate_limit_hits > self.link_rate_limit_retry_limit:
                     last_err = r.text[:120] or "rate limited"
@@ -511,8 +724,7 @@ class GoPayCharger:
                         self.link_rate_limit_sleep_s + jitter,
                     )
                 self.log(
-                    f"[gopay] midtrans linking 429 rate limited, "
-                    f"冷却 {wait_s:.0f}s 再重试 "
+                    f"[gopay] midtrans linking 冷却 {wait_s:.0f}s 再重试 "
                     f"{rate_limit_hits}/{self.link_rate_limit_retry_limit}"
                 )
                 time.sleep(wait_s)
@@ -549,6 +761,7 @@ class GoPayCharger:
         if not r.json().get("success"):
             raise GoPayError(f"user-consent failed: {r.text[:300]}")
         self.log("[gopay] consent ok, OTP sent via WhatsApp")
+        self.log("[gopay] waiting WhatsApp OTP from relay: manual-fallback")
 
     def _gopay_validate_otp(self, reference_id: str, otp: str) -> tuple[str, str]:
         """Returns (challenge_id, client_id) for PIN tokenization."""
@@ -652,7 +865,8 @@ class GoPayCharger:
         r.raise_for_status()
         data = r.json()
         link = data.get("gopay_verification_link_url", "")
-        m = re.search(r"reference=([A-Za-z0-9]+)", link)
+        self.log(f"[gopay] midtrans charge response: {json.dumps(data, ensure_ascii=False)[:800]}")
+        m = re.search(r"reference=([A-Za-z0-9-]+)", link)
         if not m:
             raise GoPayError(f"midtrans charge: no reference in {link!r}")
         charge_ref = m.group(1)
@@ -983,6 +1197,222 @@ def _headers_cfg(raw: Any) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
+def _truthy(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _configured_gopay_unlink_cfg(cfg: dict, gopay_cfg: dict) -> dict:
+    """Return the best matching ADB unlink config for this GoPay run."""
+    candidates = [
+        ((cfg.get("cpa") or {}).get("gopay_unlink") or {}),
+        (cfg.get("gopay_unlink") or {}),
+        (gopay_cfg.get("gopay_unlink") or {}),
+        (gopay_cfg.get("unlink") or {}),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate:
+            return dict(candidate)
+    return {}
+
+
+def _run_configured_gopay_unlink(
+    unlink_cfg: dict,
+    *,
+    log: Callable[[str], None] = print,
+    reason: str = "account already linked",
+) -> bool:
+    """Best-effort ADB unlink used before retrying Midtrans 406 conflicts."""
+    if not isinstance(unlink_cfg, dict) or not unlink_cfg:
+        return False
+    if not (_truthy(unlink_cfg.get("enabled")) or _truthy(os.getenv("GOPAY_ADB_UNLINK"))):
+        return False
+    if not _truthy(unlink_cfg.get("on_linking_406"), default=True):
+        log("[gopay] ADB unlink on linking 406 disabled by config")
+        return False
+
+    root = Path(__file__).resolve().parents[1]
+    adb_path = unlink_cfg.get("adb_path") or os.getenv("GOPAY_ADB_PATH") or "adb"
+    device = unlink_cfg.get("device") or os.getenv("GOPAY_ADB_DEVICE") or "127.0.0.1:16384"
+    ldconsole_path = unlink_cfg.get("ldconsole_path") or os.getenv("GOPAY_LDCONSOLE_PATH") or ""
+    ldconsole_index = unlink_cfg.get("ldconsole_index") or os.getenv("GOPAY_LDCONSOLE_INDEX") or ""
+    ldconsole_name = unlink_cfg.get("ldconsole_name") or os.getenv("GOPAY_LDCONSOLE_NAME") or ""
+    flow = (
+        unlink_cfg.get("flow")
+        or os.getenv("GOPAY_ADB_FLOW")
+        or "unlink_first_app_from_account_settings"
+    )
+    config_path = (
+        unlink_cfg.get("config")
+        or os.getenv("GOPAY_ADB_CONFIG")
+        or str(root / "scripts" / "gopay_adb_coords.example.json")
+    )
+    try:
+        timeout_s = int(unlink_cfg.get("timeout_s") or os.getenv("GOPAY_ADB_TIMEOUT_S") or 90)
+    except (TypeError, ValueError):
+        timeout_s = 90
+    set_ratios = unlink_cfg.get("set_ratios") or {
+        "first_linked_app_unlink": "0.75,0.19",
+        "confirm_unlink": "0.52,0.88",
+    }
+
+    if ldconsole_path and (ldconsole_index != "" or ldconsole_name):
+        target_args = ["--index", str(ldconsole_index)] if ldconsole_index != "" else ["--name", str(ldconsole_name)]
+        try:
+            state = subprocess.run(
+                [str(ldconsole_path), "isrunning", *target_args],
+                text=True,
+                capture_output=True,
+                timeout=8,
+            )
+            running = "running" in ((state.stdout or "") + (state.stderr or "")).lower()
+            if not running:
+                log(
+                    "[gopay] ADB target emulator is not running; "
+                    f"launching via ldconsole {' '.join(target_args)}"
+                )
+                subprocess.run(
+                    [str(ldconsole_path), "launch", *target_args],
+                    text=True,
+                    capture_output=True,
+                    timeout=15,
+                )
+                boot_wait_s = float(unlink_cfg.get("ldconsole_boot_wait_s") or os.getenv("GOPAY_LDCONSOLE_BOOT_WAIT_S") or 25)
+                time.sleep(max(0.0, boot_wait_s))
+        except Exception as exc:
+            log(f"[gopay] ldconsole preflight failed: {exc}")
+
+    def _probe_adb_once(timeout_s: float) -> tuple[bool, str]:
+        try:
+            probe = subprocess.run(
+                [str(adb_path), "-s", str(device), "shell", "wm", "size"],
+                text=True,
+                capture_output=True,
+                timeout=timeout_s,
+            )
+            detail = ((probe.stdout or "") + (probe.stderr or "")).strip()
+            return probe.returncode == 0, detail
+        except subprocess.TimeoutExpired:
+            return False, f"timeout after {timeout_s:.0f}s"
+        except Exception as exc:
+            return False, str(exc)
+
+    ok, detail = _probe_adb_once(float(unlink_cfg.get("adb_probe_timeout_s") or 8))
+    if not ok:
+        log(f"[gopay] ADB preflight failed for {device}: {detail}; restarting adb server")
+        try:
+            subprocess.run([str(adb_path), "kill-server"], text=True, capture_output=True, timeout=8)
+            subprocess.run([str(adb_path), "start-server"], text=True, capture_output=True, timeout=12)
+        except Exception as exc:
+            log(f"[gopay] ADB server restart failed: {exc}")
+        ok, detail = _probe_adb_once(float(unlink_cfg.get("adb_probe_timeout_s") or 8))
+        if not ok and _truthy(unlink_cfg.get("kill_stale_adb"), default=True):
+            try:
+                adb_resolved = str(Path(str(adb_path)).resolve()).lower()
+            except Exception:
+                adb_resolved = str(adb_path).lower()
+            killed = 0
+            try:
+                ps = subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-Command",
+                        (
+                            "$target = "
+                            + json.dumps(adb_resolved)
+                            + "; "
+                            "Get-CimInstance Win32_Process -Filter \"Name='adb.exe'\" | "
+                            "Where-Object { "
+                            "  $p = [string]$_.ExecutablePath; "
+                            "  $p -and ($p.ToLower() -eq $target) "
+                            "} | ForEach-Object { "
+                            "  Stop-Process -Id $_.ProcessId -Force; "
+                            "  $_.ProcessId "
+                            "}"
+                        ),
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=12,
+                )
+                killed = len([line for line in (ps.stdout or "").splitlines() if line.strip()])
+            except Exception as exc:
+                log(f"[gopay] stale adb cleanup failed: {exc}")
+            if killed:
+                log(f"[gopay] killed {killed} stale adb process(es), retrying preflight")
+                time.sleep(2)
+            elif _truthy(unlink_cfg.get("kill_all_adb_on_failure"), default=True):
+                try:
+                    subprocess.run(
+                        [
+                            "powershell",
+                            "-NoProfile",
+                            "-Command",
+                            "Get-Process adb -ErrorAction SilentlyContinue | Stop-Process -Force",
+                        ],
+                        text=True,
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    log("[gopay] killed all adb process(es), retrying preflight")
+                    time.sleep(2)
+                except Exception as exc:
+                    log(f"[gopay] all-adb cleanup failed: {exc}")
+            try:
+                subprocess.run([str(adb_path), "start-server"], text=True, capture_output=True, timeout=12)
+            except Exception:
+                pass
+            ok, detail = _probe_adb_once(float(unlink_cfg.get("adb_probe_timeout_s") or 8))
+        if not ok:
+            log(f"[gopay] ADB preflight still failed for {device}: {detail}")
+            return False
+    else:
+        log(f"[gopay] ADB preflight ok for {device}: {detail.splitlines()[0] if detail else 'ok'}")
+
+    cmd = [
+        sys.executable,
+        str(root / "scripts" / "gopay_adb_unlink.py"),
+        "--adb",
+        str(adb_path),
+        "--device",
+        str(device),
+        "--config",
+        str(config_path),
+    ]
+    if isinstance(set_ratios, dict):
+        for name, value in set_ratios.items():
+            cmd.extend(["--set-ratio", f"{name}={value}"])
+    cmd.extend(["run-flow", str(flow), "--execute", "--allow-unlink", "--yes"])
+
+    log(f"[gopay] account already linked; triggering ADB unlink ({reason}) device={device}")
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(root),
+            text=True,
+            capture_output=True,
+            timeout=timeout_s,
+        )
+    except Exception as exc:
+        log(f"[gopay] ADB unlink launch failed: {exc}")
+        return False
+
+    output = (proc.stdout or "").strip()
+    if output:
+        for line in output.splitlines():
+            log(f"[gopay-unlink] {line}")
+    if proc.returncode == 0:
+        log("[gopay] ADB unlink confirmed, retrying linking next")
+        return True
+    err = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()
+    log(f"[gopay] ADB unlink failed rc={proc.returncode}: {err[:500]}")
+    return False
+
+
 def whatsapp_file_otp_provider(
     path: Path,
     *,
@@ -1244,17 +1674,14 @@ def _build_chatgpt_session(auth_cfg: dict) -> Any:
     access_token = (auth_cfg.get("access_token") or "").strip()
     cookie_header = (auth_cfg.get("cookie_header") or "").strip()
     device_id = (auth_cfg.get("device_id") or "").strip() or str(uuid.uuid4())
-    user_agent = auth_cfg.get("user_agent") or (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
-    )
+    user_agent = auth_cfg.get("user_agent") or DEFAULT_CHATGPT_USER_AGENT
 
     if not (session_token or cookie_header):
         raise GoPayError(
             "auth missing: need session_token or cookie_header in config",
         )
 
-    s = _new_session()
+    s = _new_session(_curl_impersonate_for_user_agent(user_agent))
     s.headers.update({
         "User-Agent": user_agent,
         "Accept": "*/*",
@@ -1264,9 +1691,9 @@ def _build_chatgpt_session(auth_cfg: dict) -> Any:
         "Content-Type": "application/json",
         "oai-device-id": device_id,
         "oai-language": "en-US",
-        "sec-ch-ua": '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+        "sec-ch-ua": _sec_ch_ua_for_user_agent(user_agent),
         "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua-platform": _sec_ch_platform_for_user_agent(user_agent),
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
@@ -1318,6 +1745,11 @@ def main():
     args = parser.parse_args()
 
     cfg = _load_cfg(args.config)
+    cfg["_loaded_from"] = str(Path(args.config).resolve())
+    selected_user_agent = _select_config_user_agent(cfg)
+    if selected_user_agent:
+        auth_cfg_for_ua = cfg.setdefault("fresh_checkout", {}).setdefault("auth", {})
+        auth_cfg_for_ua.setdefault("user_agent", selected_user_agent)
     gopay_cfg = cfg.get("gopay") or {}
     if not gopay_cfg:
         print("[error] config has no 'gopay' block", file=sys.stderr)
@@ -1353,6 +1785,7 @@ def main():
         cs_session, gopay_cfg,
         otp_provider=provider, proxy=proxy_url,
         runtime_cfg=cfg.get("runtime"),
+        unlink_cfg=_configured_gopay_unlink_cfg(cfg, gopay_cfg),
     )
     try:
         if args.from_redirect_url:

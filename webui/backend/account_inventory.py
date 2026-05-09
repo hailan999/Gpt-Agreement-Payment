@@ -195,8 +195,9 @@ def build_accounts_inventory() -> dict:
         has_session = bool(acc.get("session_token"))
         has_access = bool(acc.get("access_token"))
         has_auth = has_session or has_access
+        account_status = str(acc.get("status") or "INITIAL").upper()
         has_rt = email in rt_emails
-        consumed = email in consumed_emails
+        consumed = email in consumed_emails or account_status in ("SUCCESS", "FAILED", "NO_TRIAL")
         oauth = oauth_map.get(email.lower()) or oauth_map.get(email) or {}
         latest = latest_payment.get(email) or {}
         error = str(latest.get("error") or "")
@@ -205,6 +206,8 @@ def build_accounts_inventory() -> dict:
             pay_state = "consumed"
         elif not has_auth:
             pay_state = "no_auth"
+        elif account_status != "INITIAL":
+            pay_state = "consumed"
         rt_state = _rt_state(has_rt, oauth)
         can_backfill_rt = rt_state in ("missing", "retryable")
 
@@ -239,6 +242,7 @@ def build_accounts_inventory() -> dict:
             "cpa_status": cpa_status,
             "cpa_pushed": cpa_pushed,
             "registered_at": acc.get("ts") or "",
+            "account_status": account_status,
             "attempts": attempts.get(email, 1),
             "has_session_token": has_session,
             "has_access_token": has_access,

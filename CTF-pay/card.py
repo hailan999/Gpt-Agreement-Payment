@@ -16,6 +16,7 @@ import argparse
 import base64
 import glob
 import hashlib
+import html
 import http.server
 import json
 import os
@@ -207,17 +208,42 @@ def _create_chatgpt_http_session(
     proxy_url = _build_proxy_url_from_cfg(_resolve_proxy_cfg(cfg, proxy_cfg_override))
 
     if _HAS_CURL_CFFI:
-        http = CurlCffiSession(impersonate="chrome136")
+        impersonate = _curl_cffi_impersonate_for_user_agent(user_agent)
+        http = CurlCffiSession(impersonate=impersonate)
         _apply_proxy_to_http_session(http, proxy_url)
         if user_agent:
             http.headers.update({"user-agent": user_agent})
-        return http, "curl_cffi(chrome136)"
+        return http, f"curl_cffi({impersonate})"
 
     http = requests.Session()
     _apply_proxy_to_http_session(http, proxy_url)
     if user_agent:
         http.headers.update({"user-agent": user_agent})
     return http, "requests"
+
+
+def _curl_cffi_impersonate_for_user_agent(user_agent: str = "") -> str:
+    """Choose the closest curl_cffi Chrome impersonation profile for a UA."""
+    supported = set()
+    default_chrome = "chrome"
+    if _HAS_CURL_CFFI:
+        try:
+            from curl_cffi.requests.impersonate import BrowserTypeLiteral, DEFAULT_CHROME
+            supported = set(getattr(BrowserTypeLiteral, "__args__", ()) or ())
+            default_chrome = str(DEFAULT_CHROME or default_chrome)
+        except Exception:
+            supported = set()
+    match = re.search(r"Chrome/(\d+)", str(user_agent or ""))
+    if match:
+        exact = f"chrome{match.group(1)}"
+        if exact in supported:
+            return exact
+    if default_chrome in supported:
+        return default_chrome
+    for candidate in ("chrome146", "chrome145", "chrome142", "chrome136", "chrome"):
+        if not supported or candidate in supported:
+            return candidate
+    return "chrome"
 
 
 def _describe_proxy_cfg(proxy_cfg) -> str:
@@ -407,7 +433,11 @@ def _load_existing_auth_from_local_bundle_config(cfg: dict, fresh_cfg: dict) -> 
                 )
                 continue
 
-        email = _extract_email_from_access_token(access_token) if access_token else ""
+        session_claims = _extract_chatgpt_claims_from_token(session_token)
+        email = (
+            session_claims.get("email", "")
+            or (_extract_email_from_access_token(access_token) if access_token else "")
+        )
         _log(
             "      [fresh] 检测到本地 bundle 现成登录态: "
             f"config={candidate_path} "
@@ -889,6 +919,55 @@ def _browser_like_session_headers(locale_value: str | None, user_agent: str = ""
     }
 
 
+def _log_browser_fingerprint_summary(
+    label: str,
+    *,
+    user_agent: str = "",
+    accept_language: str = "",
+    locale_profile: dict | None = None,
+    extra: dict | None = None,
+) -> None:
+    """Log the effective browser-ish fingerprint values used by the flow."""
+    profile = locale_profile or {}
+    ua = user_agent or USER_AGENT
+    locale_value = profile.get("browser_locale") or ""
+    language = profile.get("browser_language") or locale_value
+    accept = accept_language or _accept_language_for_locale(locale_value)
+    timezone_name = profile.get("browser_timezone") or ""
+    tz_offset = ""
+    if timezone_name:
+        try:
+            tz_offset = str(_browser_tz_offset(profile))
+        except Exception:
+            tz_offset = "?"
+    screen_w = profile.get("screen_w") or ""
+    screen_h = profile.get("screen_h") or ""
+    viewport_w = profile.get("viewport_w") or ""
+    viewport_h = profile.get("viewport_h") or ""
+    dpr = profile.get("dpr") or ""
+    color_depth = profile.get("color_depth") or ""
+    bits = [
+        f"ua={ua}",
+        f"accept_language={accept}",
+        f"locale={locale_value}",
+        f"language={language}",
+        f"timezone={timezone_name}",
+    ]
+    if tz_offset:
+        bits.append(f"tz_offset={tz_offset}")
+    if screen_w or screen_h:
+        bits.append(f"screen={screen_w}x{screen_h}")
+    if viewport_w or viewport_h:
+        bits.append(f"viewport={viewport_w}x{viewport_h}")
+    if dpr != "":
+        bits.append(f"dpr={dpr}")
+    if color_depth != "":
+        bits.append(f"color_depth={color_depth}")
+    for key, value in (extra or {}).items():
+        bits.append(f"{key}={value}")
+    _log(f"      [指纹] {label}: " + " | ".join(bits))
+
+
 def _elements_options_client_payload() -> dict:
     return {
         "elements_options_client[stripe_js_locale]": "auto",
@@ -1072,6 +1151,25 @@ def register_fingerprint(http: "requests.Session") -> tuple[str, str, str]:
     cpu = random.choice([4, 8, 12, 16])
     canvas_fp = random.choice(_CANVAS_FPS)
     audio_fp = random.choice(_AUDIO_FPS)
+    session_ua = getattr(http, "headers", {}).get("User-Agent", "") if http is not None else ""
+    effective_user_agent = session_ua or USER_AGENT
+    try:
+        setattr(http, "_stripe_fingerprint_profile", {
+            "user_agent": effective_user_agent,
+            "screen": {
+                "width": sw,
+                "height": sh,
+                "viewport_width": sw,
+                "viewport_height": vh,
+                "dpr": dpr,
+                "color_depth": 24,
+            },
+            "platform": "Win32",
+            "cpu": cpu,
+            "plugins": len(_PLUGINS_STR.split(",")),
+        })
+    except Exception:
+        pass
 
     def _build_full(v2: int, inc_ids: bool) -> dict:
         s1, s2, s3, s4, s5 = (_b64url_seg() for _ in range(5))
@@ -1092,7 +1190,7 @@ def register_fingerprint(http: "requests.Session") -> tuple[str, str, str]:
                 "i": {"v": "sessionStorage-enabled, localStorage-enabled", "t": round(random.uniform(0.5, 2), 1)},
                 "j": {"v": canvas_fp, "t": round(random.uniform(5, 120), 1)},
                 "k": {"v": "", "t": 0},
-                "l": {"v": USER_AGENT, "t": 0},
+                "l": {"v": effective_user_agent, "t": 0},
                 "m": {"v": "", "t": 0},
                 "n": {"v": "false", "t": round(random.uniform(3, 50), 1)},
                 "o": {"v": audio_fp, "t": round(random.uniform(20, 30), 1)},
@@ -1121,7 +1219,7 @@ def register_fingerprint(http: "requests.Session") -> tuple[str, str, str]:
         }
 
     m6_headers = {
-        "User-Agent": USER_AGENT,
+        "User-Agent": effective_user_agent,
         "Content-Type": "text/plain;charset=UTF-8",
         "Accept": "*/*",
         "Origin": "https://m.stripe.network",
@@ -1129,6 +1227,13 @@ def register_fingerprint(http: "requests.Session") -> tuple[str, str, str]:
     }
     m6_url = "https://m.stripe.com/6"
     _log("      [指纹] 向 m.stripe.com/6 注册设备指纹 ...")
+    _log(
+        "      [指纹] m.stripe.com/6 上报参数: "
+        f"session_ua={session_ua or '-'} | m6_ua={m6_headers['User-Agent']} | "
+        f"screen={sw}x{sh} viewport={sw}x{vh} dpr={dpr} color_depth=24 | "
+        f"platform=Win32 cpu={cpu} plugins={len(_PLUGINS_STR.split(','))} | "
+        f"canvas={canvas_fp[:16]}... audio={audio_fp[:16]}..."
+    )
 
     # #1 完整指纹 (v2=1, 无 ID)
     try:
@@ -1190,7 +1295,46 @@ def _resolve_preseeded_stripe_fingerprint(cfg: dict) -> dict:
     user_agent = str(fp.get("user_agent") or fp.get("userAgent") or "").strip()
     if user_agent:
         result["user_agent"] = user_agent
+    for key in ("accept_language", "browser_locale", "browser_language", "browser_timezone"):
+        value = str(fp.get(key) or "").strip()
+        if value:
+            result[key] = value
+    screen = fp.get("screen")
+    if isinstance(screen, dict):
+        result["screen"] = dict(screen)
+    for key in ("platform", "cpu", "plugins"):
+        if fp.get(key) not in (None, ""):
+            result[key] = fp.get(key)
     return result
+
+
+def _locale_profile_from_stripe_fingerprint(base_profile: dict, fp: dict) -> dict:
+    profile = dict(base_profile or LOCALE_PROFILES["US"])
+    if not isinstance(fp, dict):
+        return profile
+    if fp.get("browser_locale"):
+        profile["browser_locale"] = fp["browser_locale"]
+    if fp.get("browser_language"):
+        profile["browser_language"] = fp["browser_language"]
+    elif fp.get("browser_locale"):
+        profile["browser_language"] = fp["browser_locale"]
+    if fp.get("browser_timezone"):
+        profile["browser_timezone"] = fp["browser_timezone"]
+    screen = fp.get("screen") if isinstance(fp.get("screen"), dict) else {}
+    if screen:
+        if screen.get("width") not in (None, ""):
+            profile["screen_w"] = int(screen["width"])
+        if screen.get("height") not in (None, ""):
+            profile["screen_h"] = int(screen["height"])
+        if screen.get("dpr") not in (None, ""):
+            profile["dpr"] = screen["dpr"]
+        if screen.get("color_depth") not in (None, ""):
+            profile["color_depth"] = int(screen["color_depth"])
+        if screen.get("viewport_width") not in (None, ""):
+            profile["viewport_w"] = int(screen["viewport_width"])
+        if screen.get("viewport_height") not in (None, ""):
+            profile["viewport_h"] = int(screen["viewport_height"])
+    return profile
 
 
 def _gen_elements_session_id():
@@ -1281,6 +1425,73 @@ def _extract_plan_type_from_access_token(token: str) -> str:
     if isinstance(auth_claim, dict):
         return auth_claim.get("chatgpt_plan_type", "") or ""
     return ""
+
+
+def _extract_chatgpt_claims_from_token(token: str) -> dict:
+    payload = _decode_jwt_payload(token)
+    if not payload:
+        return {}
+
+    profile = payload.get("https://api.openai.com/profile", {})
+    if not isinstance(profile, dict):
+        profile = {}
+    auth_claim = payload.get("https://api.openai.com/auth", {})
+    if not isinstance(auth_claim, dict):
+        auth_claim = {}
+    user_claim = payload.get("user", {})
+    if not isinstance(user_claim, dict):
+        user_claim = {}
+    account_claim = payload.get("account", {})
+    if not isinstance(account_claim, dict):
+        account_claim = {}
+
+    return {
+        "email": (
+            profile.get("email")
+            or payload.get("email")
+            or user_claim.get("email")
+            or ""
+        ),
+        "plan_type": (
+            auth_claim.get("chatgpt_plan_type")
+            or account_claim.get("planType")
+            or account_claim.get("plan_type")
+            or payload.get("planType")
+            or payload.get("plan_type")
+            or ""
+        ),
+        "account_id": (
+            auth_claim.get("chatgpt_account_id")
+            or account_claim.get("id")
+            or account_claim.get("account_id")
+            or payload.get("account_id")
+            or ""
+        ),
+        "user_id": (
+            auth_claim.get("chatgpt_user_id")
+            or profile.get("user_id")
+            or user_claim.get("id")
+            or payload.get("sub")
+            or ""
+        ),
+        "exp": payload.get("exp") or "",
+        "iat": payload.get("iat") or "",
+    }
+
+
+def _token_fingerprint(token: str) -> str:
+    token = (token or "").strip()
+    if not token:
+        return "-"
+    return hashlib.sha256(token.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+
+def _first_claim_with_source(*candidates: tuple[str, str]) -> tuple[str, str]:
+    for source, value in candidates:
+        value = str(value or "").strip()
+        if value:
+            return value, source
+    return "?", "missing"
 
 
 def _is_access_token_expired(token: str, skew_seconds: int = 120) -> bool:
@@ -2309,9 +2520,13 @@ def generate_fresh_checkout(
         session_token=session_token,
         device_id=oai_device_id or bootstrap.get("oai_device_id", ""),
     )
-    user_agent = auth_cfg.get("user_agent") or bootstrap.get("user_agent") or USER_AGENT
+    preseeded_fp = _resolve_preseeded_stripe_fingerprint(cfg)
+    if preseeded_fp:
+        locale_profile = _locale_profile_from_stripe_fingerprint(locale_profile, preseeded_fp)
+    user_agent = preseeded_fp.get("user_agent") or auth_cfg.get("user_agent") or bootstrap.get("user_agent") or USER_AGENT
     accept_language = (
-        auth_cfg.get("accept_language")
+        preseeded_fp.get("accept_language")
+        or auth_cfg.get("accept_language")
         or bootstrap.get("accept_language")
         or _accept_language_for_locale(locale_profile["browser_locale"])
     )
@@ -2332,6 +2547,13 @@ def generate_fresh_checkout(
         proxy_cfg_override=fresh_proxy_cfg,
     )
     _log(f"      [fresh] ChatGPT transport: {fresh_transport}")
+    _log_browser_fingerprint_summary(
+        "fresh checkout 浏览器上下文",
+        user_agent=user_agent,
+        accept_language=accept_language,
+        locale_profile=locale_profile,
+        extra={"device_id": (oai_device_id[:16] + "...") if oai_device_id else "-"},
+    )
     resolved_fresh_proxy_url = _build_proxy_url_from_cfg(_resolve_proxy_cfg(cfg, fresh_proxy_cfg))
     if resolved_fresh_proxy_url:
         _log(f"      [fresh] ChatGPT proxy: {resolved_fresh_proxy_url}")
@@ -2375,17 +2597,63 @@ def generate_fresh_checkout(
             "未提供 fresh_checkout.auth.access_token，且也无法通过 session_token/cookie 刷新"
         )
 
-    user_email = (auth_data.get("user") or {}).get("email", "") or _extract_email_from_access_token(access_token) or "?"
-    plan_type = (auth_data.get("account") or {}).get("planType", "") or _extract_plan_type_from_access_token(access_token) or "?"
+    session_claims = _extract_chatgpt_claims_from_token(session_token)
+    access_claims = _extract_chatgpt_claims_from_token(access_token)
+    auth_user = auth_data.get("user") or {}
+    if not isinstance(auth_user, dict):
+        auth_user = {}
+    auth_account = auth_data.get("account") or {}
+    if not isinstance(auth_account, dict):
+        auth_account = {}
+
+    user_email, user_email_source = _first_claim_with_source(
+        ("session_token", session_claims.get("email")),
+        ("auth_session", auth_user.get("email", "")),
+        ("access_token", access_claims.get("email")),
+    )
+    plan_type, plan_type_source = _first_claim_with_source(
+        ("session_token", session_claims.get("plan_type")),
+        ("auth_session", auth_account.get("planType", "")),
+        ("access_token", access_claims.get("plan_type")),
+    )
+    account_id, account_id_source = _first_claim_with_source(
+        ("session_token", session_claims.get("account_id")),
+        ("access_token", access_claims.get("account_id")),
+    )
+    user_id, user_id_source = _first_claim_with_source(
+        ("session_token", session_claims.get("user_id")),
+        ("access_token", access_claims.get("user_id")),
+    )
     _log(
         "      [fresh] 凭证来源: "
         f"access_token={'yes' if access_token else 'no'} "
         f"session_token={'yes' if session_token else 'no'} "
         f"cookie={'yes' if cookie_header else 'no'}"
     )
-    _log(f"      [fresh] 当前账号: {user_email}  |  planType={plan_type}")
+    _log(
+        "      [fresh] 凭证指纹: "
+        f"session_token={_token_fingerprint(session_token)} "
+        f"access_token={_token_fingerprint(access_token)}"
+    )
+    if session_claims:
+        _log("      [fresh] 凭证解析优先级: session_token → auth_session → access_token")
+    else:
+        _log("      [fresh] 凭证解析优先级: auth_session → access_token (session_token 不可解码)")
+    account_bits = [
+        f"当前账号({user_email_source})={user_email}",
+        f"planType({plan_type_source})={plan_type}",
+    ]
+    if account_id != "?":
+        account_bits.append(f"account_id({account_id_source})={account_id}")
+    if user_id != "?":
+        account_bits.append(f"user_id({user_id_source})={user_id}")
+    _log("      [fresh] " + "  |  ".join(account_bits))
     # 保存到上下文供后续记录
     fresh_cfg["_chatgpt_email"] = user_email
+    if account_id:
+        fresh_cfg["_chatgpt_account_id"] = account_id
+    if user_id:
+        fresh_cfg["_chatgpt_user_id"] = user_id
 
     attempt_specs = []
     plan_cfg = fresh_cfg.get("plan") or {}
@@ -4517,6 +4785,7 @@ def _drive_gopay_from_redirect(
         cs_session, gopay_cfg,
         otp_provider=provider, proxy=proxy,
         runtime_cfg=cfg.get("runtime"),
+        unlink_cfg=_gopay._configured_gopay_unlink_cfg(cfg, gopay_cfg),
     )
     _log(f"      [gopay] 从 redirect 接管 → {redirect_url[:80]}...")
     result = charger.run_from_redirect(redirect_url, cs_id=session_id)
@@ -5244,11 +5513,25 @@ def _fetch_openai_login_otp(
     target_email: str,
     timeout: int = 180,
     issued_after: float | None = None,
+    mail_cfg: dict | None = None,
 ) -> str:
-    """从 CF KV 取 OpenAI 登录 OTP（worker 已替代 IMAP→QQ 转发链路）。
+    """Fetch OpenAI login OTP.
 
-    返回空串表示超时或 KV 路径配置缺失，调用方按需 fallback。
+    Hotmail/Outlook accounts can be read directly through Microsoft OAuth
+    refresh_token + Graph/Outlook mail APIs. Other domains keep using CF KV.
+    Empty string means timeout or provider configuration is missing.
     """
+    if _is_microsoft_mailbox(target_email):
+        hotmail_code = _fetch_hotmail_openai_login_otp(
+            target_email,
+            mail_cfg or {},
+            timeout=timeout,
+            issued_after=issued_after,
+        )
+        if hotmail_code:
+            return hotmail_code
+        _log("      [RT-OTP] Hotmail 未取到验证码，回落 CF KV")
+
     try:
         from cf_kv_otp_provider import CloudflareKVOtpProvider
     except ImportError as e:
@@ -5267,6 +5550,583 @@ def _fetch_openai_login_otp(
     except Exception as e:
         _log(f"      [RT-OTP] CF KV 取 OTP 异常: {e}")
         return ""
+
+
+_MS_TOKEN_ENDPOINTS = [
+    (
+        "entra-consumers-delegated",
+        "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+        {"scope": "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/User.Read"},
+    ),
+    (
+        "entra-common-delegated",
+        "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        {"scope": "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/User.Read"},
+    ),
+    ("live", "https://login.live.com/oauth20_token.srf", {}),
+    ("entra-common-default", "https://login.microsoftonline.com/common/oauth2/v2.0/token", {"scope": "https://graph.microsoft.com/.default"}),
+    ("entra-common-outlook", "https://login.microsoftonline.com/common/oauth2/v2.0/token", {}),
+]
+
+
+def _is_microsoft_mailbox(email_addr: str) -> bool:
+    domain = str(email_addr or "").rsplit("@", 1)[-1].strip().lower()
+    return domain in {"hotmail.com", "outlook.com", "live.com", "msn.com"}
+
+
+def _hotmail_cfg_value(data: dict, *keys: str) -> str:
+    for key in keys:
+        value = data.get(key) if isinstance(data, dict) else ""
+        text = str(value or "").strip()
+        if text and not text.upper().startswith("YOUR_"):
+            return text
+    return ""
+
+
+def _hotmail_saved_rt_key(email_addr: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.@-]+", "_", str(email_addr or "").strip().lower())
+    return f"hotmail_refresh_token:{safe}"
+
+
+def _load_saved_hotmail_refresh_token(email_addr: str) -> str:
+    try:
+        data = get_db().get_runtime_json(_hotmail_saved_rt_key(email_addr), {}) or {}
+        return str(data.get("refresh_token") or "").strip()
+    except Exception:
+        return ""
+
+
+def _save_hotmail_refresh_token(email_addr: str, refresh_token: str, meta: dict | None = None) -> None:
+    refresh_token = str(refresh_token or "").strip()
+    if not refresh_token:
+        return
+    try:
+        payload = {
+            "email": str(email_addr or "").strip().lower(),
+            "refresh_token": refresh_token,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        payload.update(meta or {})
+        get_db().set_runtime_json(_hotmail_saved_rt_key(email_addr), payload)
+        try:
+            get_db().update_registered_account_hotmail_refresh_token(email_addr, refresh_token)
+        except Exception as e:
+            _log(f"      [RT-OTP] Hotmail next refresh_token 写回账号表失败: {e}")
+    except Exception as e:
+        _log(f"      [RT-OTP] Hotmail next refresh_token 保存失败: {e}")
+
+
+def _load_registered_hotmail_credentials(email_addr: str) -> dict:
+    try:
+        row = get_db().find_latest_registered_account(email_addr) or {}
+    except Exception:
+        row = {}
+    return {
+        "client_id": str(row.get("hot_client") or "").strip(),
+        "refresh_token": str(row.get("hot_rt") or "").strip(),
+    }
+
+
+def _resolve_hotmail_account_cfg(target_email: str, mail_cfg: dict) -> dict:
+    hotmail_cfg = {}
+    if isinstance(mail_cfg, dict):
+        hotmail_cfg = mail_cfg.get("hotmail") if isinstance(mail_cfg.get("hotmail"), dict) else {}
+    accounts = []
+    for source in (
+        hotmail_cfg.get("accounts") if isinstance(hotmail_cfg, dict) else None,
+        mail_cfg.get("hotmail_accounts") if isinstance(mail_cfg, dict) else None,
+        mail_cfg.get("microsoft_accounts") if isinstance(mail_cfg, dict) else None,
+    ):
+        if isinstance(source, list):
+            accounts.extend([item for item in source if isinstance(item, dict)])
+    target = str(target_email or "").strip().lower()
+    picked = {}
+    for account in accounts:
+        if str(account.get("email") or "").strip().lower() == target:
+            picked = dict(account)
+            break
+    if not picked and accounts:
+        picked = dict(accounts[0])
+    merged = dict(hotmail_cfg or {})
+    merged.update(picked)
+    db_creds = _load_registered_hotmail_credentials(target)
+    env_client_id = os.getenv("HOTMAIL_CLIENT_ID") or os.getenv("MICROSOFT_CLIENT_ID") or ""
+    env_rt = os.getenv("HOTMAIL_REFRESH_TOKEN") or os.getenv("MICROSOFT_REFRESH_TOKEN") or ""
+    client_id = (
+        db_creds.get("client_id")
+        or _hotmail_cfg_value(merged, "clientId", "client_id", "clientID", "microsoft_client_id")
+        or env_client_id
+    )
+    refresh_token = (
+        _load_saved_hotmail_refresh_token(target)
+        or db_creds.get("refresh_token")
+        or _hotmail_cfg_value(merged, "refreshToken", "refresh_token", "rt", "token")
+        or env_rt
+    )
+    mailboxes = merged.get("mailboxes")
+    if not isinstance(mailboxes, list) or not mailboxes:
+        mailboxes = ["INBOX", "Junk"]
+    return {
+        "email": target,
+        "client_id": client_id,
+        "refresh_token": refresh_token,
+        "mailboxes": mailboxes,
+        "top": int(merged.get("top") or 5),
+        "sender_filters": merged.get("senderFilters") or merged.get("sender_filters") or ["openai", "auth0.openai.com"],
+        "subject_filters": merged.get("subjectFilters") or merged.get("subject_filters") or ["verification", "code", "login"],
+        "exclude_codes": merged.get("excludeCodes") or merged.get("exclude_codes") or [],
+    }
+
+
+def _http_post_form_json(url: str, data: dict, timeout_s: int = 45) -> dict:
+    import urllib.parse as _up
+    import urllib.request as _ur
+    body = _up.urlencode(data).encode("utf-8")
+    req = _ur.Request(url, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+    try:
+        with _ur.urlopen(req, timeout=timeout_s) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except _ur.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"HTTP {e.code} {e.reason}: {detail[:500]}") from e
+
+
+def _http_get_json(url: str, headers: dict, timeout_s: int = 45) -> dict:
+    import urllib.request as _ur
+    req = _ur.Request(url, headers=headers, method="GET")
+    try:
+        with _ur.urlopen(req, timeout=timeout_s) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except _ur.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"HTTP {e.code} {e.reason}: {detail[:500]}") from e
+
+
+def _exchange_microsoft_refresh_token(client_id: str, refresh_token: str) -> dict:
+    errors = []
+    for name, url, extra in _MS_TOKEN_ENDPOINTS:
+        data = {
+            "client_id": client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            **extra,
+        }
+        try:
+            payload = _http_post_form_json(url, data)
+            access_token = str(payload.get("access_token") or "").strip()
+            if access_token:
+                return {
+                    "access_token": access_token,
+                    "next_refresh_token": str(payload.get("refresh_token") or "").strip(),
+                    "token_endpoint": name,
+                }
+            errors.append(f"{name}: missing access_token")
+        except Exception as e:
+            errors.append(f"{name}: {str(e)[:180]}")
+    raise RuntimeError("Microsoft token refresh failed: " + " | ".join(errors))
+
+
+def _iter_microsoft_access_tokens(client_id: str, refresh_token: str):
+    current_refresh_token = refresh_token
+    for name, url, extra in _MS_TOKEN_ENDPOINTS:
+        data = {
+            "client_id": client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": current_refresh_token,
+            **extra,
+        }
+        try:
+            payload = _http_post_form_json(url, data)
+            access_token = str(payload.get("access_token") or "").strip()
+            next_refresh_token = str(payload.get("refresh_token") or "").strip()
+            if next_refresh_token:
+                current_refresh_token = next_refresh_token
+            if not access_token:
+                yield {"token_endpoint": name, "error": "missing access_token"}
+                continue
+            yield {
+                "access_token": access_token,
+                "next_refresh_token": next_refresh_token,
+                "token_endpoint": name,
+            }
+        except Exception as e:
+            yield {"token_endpoint": name, "error": str(e)[:180]}
+
+
+def _fetch_hotmail_messages_with_refresh_token(cfg: dict) -> tuple[list[dict], str, dict]:
+    errors = []
+    for token_payload in _iter_microsoft_access_tokens(cfg["client_id"], cfg["refresh_token"]):
+        endpoint = token_payload.get("token_endpoint") or "unknown"
+        if not token_payload.get("access_token"):
+            errors.append(f"{endpoint}: {token_payload.get('error') or 'missing access_token'}")
+            continue
+        try:
+            messages, transport = _fetch_hotmail_messages(
+                token_payload["access_token"],
+                cfg["mailboxes"],
+                cfg["top"],
+            )
+            return messages, transport, token_payload
+        except Exception as e:
+            rest_error = str(e)[:180]
+            if endpoint == "live" and cfg.get("email"):
+                try:
+                    messages = _fetch_hotmail_imap_messages(
+                        cfg["email"],
+                        token_payload["access_token"],
+                        cfg["mailboxes"],
+                        cfg["top"],
+                    )
+                    return messages, "imap", token_payload
+                except Exception as imap_error:
+                    errors.append(f"{endpoint}: rest={rest_error}; imap={str(imap_error)[:180]}")
+                    continue
+            errors.append(f"{endpoint}: {rest_error}")
+    raise RuntimeError("Microsoft mail fetch failed after token validation: " + " | ".join(errors))
+
+
+def _normalize_hotmail_mailbox_id(mailbox: str) -> str:
+    normalized = str(mailbox or "INBOX").strip().lower()
+    if normalized in {"junk", "junk email", "junk e-mail", "junkemail"}:
+        return "junkemail"
+    return "inbox"
+
+
+def _normalize_hotmail_mailbox_label(mailbox: str) -> str:
+    return "Junk" if _normalize_hotmail_mailbox_id(mailbox) == "junkemail" else "INBOX"
+
+
+def _parse_ms_datetime_ms(value: str) -> int:
+    if not value:
+        return 0
+    try:
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def _normalize_graph_message(message: dict, mailbox: str) -> dict:
+    sender = message.get("from", {}) if isinstance(message, dict) else {}
+    email_addr = sender.get("emailAddress", {}) if isinstance(sender, dict) else {}
+    received = str(message.get("receivedDateTime") or "").strip()
+    return {
+        "id": str(message.get("id") or message.get("internetMessageId") or "").strip(),
+        "mailbox": _normalize_hotmail_mailbox_label(mailbox),
+        "subject": str(message.get("subject") or "").strip(),
+        "from": {"emailAddress": {
+            "address": str(email_addr.get("address") or "").strip(),
+            "name": str(email_addr.get("name") or "").strip(),
+        }},
+        "bodyPreview": str(message.get("bodyPreview") or "").strip(),
+        "body": message.get("body") if isinstance(message.get("body"), dict) else {},
+        "receivedDateTime": received,
+        "receivedTimestamp": _parse_ms_datetime_ms(received),
+    }
+
+
+def _normalize_outlook_message(message: dict, mailbox: str) -> dict:
+    sender = (message.get("From") or message.get("from") or {}) if isinstance(message, dict) else {}
+    email_addr = sender.get("EmailAddress") or sender.get("emailAddress") or {} if isinstance(sender, dict) else {}
+    received = str(message.get("ReceivedDateTime") or message.get("receivedDateTime") or "").strip()
+    return {
+        "id": str(message.get("Id") or message.get("id") or "").strip(),
+        "mailbox": _normalize_hotmail_mailbox_label(mailbox),
+        "subject": str(message.get("Subject") or message.get("subject") or "").strip(),
+        "from": {"emailAddress": {
+            "address": str(email_addr.get("Address") or email_addr.get("address") or "").strip(),
+            "name": str(email_addr.get("Name") or email_addr.get("name") or "").strip(),
+        }},
+        "bodyPreview": str(message.get("BodyPreview") or message.get("bodyPreview") or "").strip(),
+        "body": message.get("Body") or message.get("body") or {},
+        "receivedDateTime": received,
+        "receivedTimestamp": _parse_ms_datetime_ms(received),
+    }
+
+
+def _fetch_hotmail_messages(access_token: str, mailboxes: list, top: int) -> tuple[list[dict], str]:
+    import urllib.parse as _up
+    errors = []
+    for transport in ("graph", "outlook"):
+        messages = []
+        try:
+            for mailbox in mailboxes:
+                mailbox_id = _normalize_hotmail_mailbox_id(mailbox)
+                if transport == "graph":
+                    query = _up.urlencode({
+                        "$top": max(1, min(int(top or 5), 30)),
+                        "$select": "id,internetMessageId,subject,from,bodyPreview,body,receivedDateTime",
+                        "$orderby": "receivedDateTime desc",
+                    })
+                    url = f"https://graph.microsoft.com/v1.0/me/mailFolders/{mailbox_id}/messages?{query}"
+                    payload = _http_get_json(url, {"Accept": "application/json", "Authorization": f"Bearer {access_token}"})
+                    messages.extend([_normalize_graph_message(item, mailbox) for item in (payload.get("value") or [])])
+                else:
+                    query = _up.urlencode({
+                        "$top": max(1, min(int(top or 5), 30)),
+                        "$select": "Id,Subject,From,BodyPreview,Body,ReceivedDateTime",
+                        "$orderby": "ReceivedDateTime desc",
+                    })
+                    url = f"https://outlook.office.com/api/v2.0/me/mailfolders/{mailbox_id}/messages?{query}"
+                    payload = _http_get_json(url, {"Accept": "application/json", "Authorization": f"Bearer {access_token}"})
+                    messages.extend([_normalize_outlook_message(item, mailbox) for item in (payload.get("value") or [])])
+            messages.sort(key=lambda item: int(item.get("receivedTimestamp") or 0), reverse=True)
+            return messages, transport
+        except Exception as e:
+            errors.append(f"{transport}: {str(e)[:180]}")
+    raise RuntimeError("Microsoft mail fetch failed: " + " | ".join(errors))
+
+
+def _decode_mime_header(value: str) -> str:
+    from email.header import decode_header
+    parts = []
+    for chunk, encoding in decode_header(str(value or "")):
+        if isinstance(chunk, bytes):
+            try:
+                parts.append(chunk.decode(encoding or "utf-8", errors="replace"))
+            except Exception:
+                parts.append(chunk.decode("utf-8", errors="replace"))
+        else:
+            parts.append(str(chunk))
+    return "".join(parts).strip()
+
+
+def _html_to_text(raw_html: str) -> str:
+    return re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"<[^>]+>", " ", html.unescape(str(raw_html or ""))),
+    ).strip()
+
+
+def _message_body_preview(message) -> str:
+    payload = ""
+    html_payload = ""
+    try:
+        if message.is_multipart():
+            for part in message.walk():
+                content_type = str(part.get_content_type() or "").lower()
+                disposition = str(part.get("Content-Disposition") or "").lower()
+                if "attachment" in disposition:
+                    continue
+                if content_type == "text/plain" and "attachment" not in disposition:
+                    data = part.get_payload(decode=True) or b""
+                    payload = data.decode(part.get_content_charset() or "utf-8", errors="replace")
+                    break
+                if content_type == "text/html" and not html_payload:
+                    data = part.get_payload(decode=True) or b""
+                    html_payload = data.decode(part.get_content_charset() or "utf-8", errors="replace")
+        else:
+            data = message.get_payload(decode=True) or b""
+            payload = data.decode(message.get_content_charset() or "utf-8", errors="replace")
+            if str(message.get_content_type() or "").lower() == "text/html":
+                html_payload = payload
+                payload = ""
+    except Exception:
+        payload = ""
+    if not payload and html_payload:
+        payload = _html_to_text(html_payload)
+    return re.sub(r"\s+", " ", payload).strip()[:4000]
+
+
+def _fetch_hotmail_imap_messages(email_addr: str, access_token: str, mailboxes: list, top: int) -> list[dict]:
+    import email as _email
+    import email.utils as _email_utils
+    import imaplib
+
+    target = str(email_addr or "").strip()
+    errors = []
+    mailbox_candidates = []
+    for mailbox in mailboxes or ["INBOX", "Junk"]:
+        normalized = _normalize_hotmail_mailbox_id(mailbox)
+        if normalized == "junkemail":
+            mailbox_candidates.extend(["Junk", "Junk Email"])
+        else:
+            mailbox_candidates.append("INBOX")
+    mailbox_candidates = list(dict.fromkeys(mailbox_candidates))
+
+    for host in ("outlook.office365.com", "imap-mail.outlook.com"):
+        imap = None
+        try:
+            imap = imaplib.IMAP4_SSL(host, 993, timeout=30)
+            auth = f"user={target}\x01auth=Bearer {access_token}\x01\x01".encode("utf-8")
+            imap.authenticate("XOAUTH2", lambda _: auth)
+            messages = []
+            for mailbox in mailbox_candidates:
+                typ, _ = imap.select(f'"{mailbox}"' if " " in mailbox else mailbox, readonly=True)
+                if typ != "OK":
+                    continue
+                typ, data = imap.uid("search", None, "ALL")
+                if typ != "OK" or not data or not data[0]:
+                    continue
+                uids = data[0].split()
+                limit = max(1, min(int(top or 5), 30))
+                for uid in reversed(uids[-limit:]):
+                    typ, fetched = imap.uid("fetch", uid, "(BODY.PEEK[])")
+                    if typ != "OK" or not fetched:
+                        continue
+                    raw = b""
+                    for item in fetched:
+                        if isinstance(item, tuple) and isinstance(item[1], bytes):
+                            raw = item[1]
+                            break
+                    if not raw:
+                        continue
+                    parsed = _email.message_from_bytes(raw)
+                    received = str(parsed.get("Date") or "").strip()
+                    try:
+                        parsed_date = _email_utils.parsedate_to_datetime(received) if received else None
+                    except Exception:
+                        parsed_date = None
+                    received_iso = parsed_date.astimezone(timezone.utc).isoformat() if parsed_date else ""
+                    sender_name, sender_addr = _email_utils.parseaddr(_decode_mime_header(parsed.get("From") or ""))
+                    messages.append({
+                        "id": str(parsed.get("Message-ID") or uid.decode("ascii", errors="ignore")).strip(),
+                        "mailbox": _normalize_hotmail_mailbox_label(mailbox),
+                        "subject": _decode_mime_header(parsed.get("Subject") or ""),
+                        "from": {"emailAddress": {
+                            "address": str(sender_addr or "").strip(),
+                            "name": str(sender_name or "").strip(),
+                        }},
+                        "bodyPreview": _message_body_preview(parsed),
+                        "receivedDateTime": received_iso,
+                        "receivedTimestamp": int(parsed_date.timestamp() * 1000) if parsed_date else 0,
+                    })
+            try:
+                imap.logout()
+            except Exception:
+                pass
+            messages.sort(key=lambda item: int(item.get("receivedTimestamp") or 0), reverse=True)
+            return messages
+        except Exception as e:
+            errors.append(f"{host}: {str(e)[:180]}")
+            try:
+                if imap is not None:
+                    imap.logout()
+            except Exception:
+                pass
+    raise RuntimeError("Microsoft IMAP fetch failed: " + " | ".join(errors))
+
+
+def _extract_hotmail_code(text: str) -> str:
+    source = str(text or "")
+    patterns = [
+        r"(?:代码为|验证码[^0-9]*?)[\s：:]*(\d{6})",
+        r"(?:chatgpt\s+log-?in\s+code|enter\s+this\s+code)[^0-9]{0,24}(\d{6})",
+        r"code(?:\s+is|[\s:])+(\d{6})",
+        r"\b(\d{6})\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, source, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _select_hotmail_code(messages: list[dict], *, issued_after: float | None, sender_filters: list, subject_filters: list, exclude_codes: list) -> tuple[str, dict]:
+    filter_after_ms = int((issued_after or 0) * 1000)
+    sender_keywords = [str(item).strip().lower() for item in sender_filters or [] if str(item).strip()]
+    subject_keywords = [str(item).strip().lower() for item in subject_filters or [] if str(item).strip()]
+    excluded = {str(item).strip() for item in exclude_codes or [] if str(item).strip()}
+    for use_time_fallback in (False, True):
+        for message in messages:
+            ts_ms = int(message.get("receivedTimestamp") or 0)
+            if not use_time_fallback and filter_after_ms and ts_ms and ts_ms < filter_after_ms:
+                continue
+            sender = str(((message.get("from") or {}).get("emailAddress") or {}).get("address") or "").lower()
+            subject = str(message.get("subject") or "")
+            preview = str(message.get("bodyPreview") or "")
+            body = message.get("body") or {}
+            body_content = str(body.get("content") or "") if isinstance(body, dict) else ""
+            body_text = _html_to_text(body_content) if body_content else ""
+            combined = " ".join([sender, subject.lower(), preview.lower(), body_text.lower()])
+            if sender_keywords and not any(keyword in combined for keyword in sender_keywords):
+                if subject_keywords and not any(keyword in combined for keyword in subject_keywords):
+                    continue
+                if not subject_keywords:
+                    continue
+            elif subject_keywords and not any(keyword in combined for keyword in subject_keywords):
+                if sender_keywords and not any(keyword in combined for keyword in sender_keywords):
+                    continue
+            code = _extract_hotmail_code(" ".join([subject, preview, body_text, sender]))
+            if code and code not in excluded:
+                return code, message
+    return "", {}
+
+
+def _fetch_hotmail_openai_login_otp(
+    target_email: str,
+    mail_cfg: dict,
+    timeout: int = 180,
+    issued_after: float | None = None,
+) -> str:
+    cfg = _resolve_hotmail_account_cfg(target_email, mail_cfg or {})
+    if not cfg.get("client_id") or not cfg.get("refresh_token"):
+        _log("      [RT-OTP] Hotmail 配置缺 client_id/refresh_token")
+        return ""
+    deadline = time.time() + max(1, int(timeout or 180))
+    attempt = 0
+    last_error = ""
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            messages, transport, token_payload = _fetch_hotmail_messages_with_refresh_token(cfg)
+            if token_payload.get("next_refresh_token"):
+                cfg["refresh_token"] = token_payload["next_refresh_token"]
+                _save_hotmail_refresh_token(
+                    target_email,
+                    token_payload["next_refresh_token"],
+                    {"token_endpoint": token_payload.get("token_endpoint") or ""},
+                )
+            code, message = _select_hotmail_code(
+                messages,
+                issued_after=issued_after,
+                sender_filters=cfg["sender_filters"],
+                subject_filters=cfg["subject_filters"],
+                exclude_codes=cfg["exclude_codes"],
+            )
+            if code:
+                _log(
+                    "      [RT-OTP] Hotmail 验证码已获取 "
+                    f"transport={transport} mailbox={message.get('mailbox', '?')} "
+                    f"subject={str(message.get('subject') or '')[:80]!r}"
+                )
+                return code
+            last_error = "no matching code"
+        except Exception as e:
+            last_error = str(e)[:240]
+        if attempt == 1 or attempt % 3 == 0:
+            _log(f"      [RT-OTP] Hotmail 等验证码中 attempt={attempt} detail={last_error}")
+        time.sleep(min(5, max(1, deadline - time.time())))
+    _log(f"      [RT-OTP] Hotmail 等 OTP 超时 {timeout}s detail={last_error}")
+    return ""
+
+
+def _mark_registered_account_status_by_email(email_addr: str, status: str, reason: str = "") -> bool:
+    target = str(email_addr or "").strip()
+    if not target:
+        return False
+    try:
+        row = get_db().find_latest_registered_account(target) or {}
+        account_id = row.get("id")
+        if not account_id:
+            _log(f"      [RT] 无 registered_accounts 记录可标记: {target}")
+            return False
+        ok = get_db().update_registered_account_status(int(account_id), status)
+        if ok:
+            suffix = f" ({reason})" if reason else ""
+            _log(f"      [RT] registered_accounts id={account_id} status -> {status}{suffix}")
+        return bool(ok)
+    except Exception as e:
+        _log(f"      [RT] 更新 registered_accounts status 失败: {e}")
+        return False
 
 
 _OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -5321,9 +6181,9 @@ def _exchange_codex_authorization_code(
 
     def _new_token_session(kind: str):
         if kind == "curl_cffi_reference" and _HAS_CURL_CFFI and curl_requests is not None:
-            return curl_requests.Session(impersonate="chrome136")
+            return curl_requests.Session(impersonate=_curl_cffi_impersonate_for_user_agent(user_agent or USER_AGENT))
         if kind == "curl_cffi_session" and _HAS_CURL_CFFI:
-            return CurlCffiSession(impersonate="chrome136")
+            return CurlCffiSession(impersonate=_curl_cffi_impersonate_for_user_agent(user_agent or USER_AGENT))
         return requests.Session()
 
     session_kinds = ["curl_cffi_reference", "curl_cffi_session", "requests"] if _HAS_CURL_CFFI else ["requests"]
@@ -5607,31 +6467,34 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                 _log(f"      [RT] 邮箱填写失败: {e}")
                 return ""
 
-            # [3] 填密码（OpenAI 现在很多场景走 passwordless，没密码框就跳过到 OTP）
-            try:
-                page.wait_for_selector('input[type="password"]', state="visible", timeout=15000)
-                pwd_input = page.query_selector('input[type="password"]:visible')
-                pwd_input.click(); time.sleep(0.3)
-                pwd_input.fill(password)
-                time.sleep(random.uniform(0.5, 1.2))
-                clicked_pwd_continue = _click_first_visible([
-                    'button[type="submit"]',
-                    'button:has-text("Continue")',
-                    'button:has-text("Log in")',
-                    'button:has-text("Sign in")',
-                    '[data-testid*="continue"]',
-                    '[data-testid*="submit"]',
-                ], "密码提交")
-                if not clicked_pwd_continue:
-                    try:
-                        pwd_input.press("Enter")
-                        _log("      [RT] 密码提交: Enter")
-                    except Exception:
-                        pass
-                time.sleep(5)
-            except Exception as e:
-                _log(f"      [RT] 密码框超时（passwordless 路径），跳过到 OTP 等待: {str(e)[:80]}")
-                _safe_screenshot(page, "/tmp/rt_pwd_skip.png")
+            # [3] 填密码（OpenAI 现在很多场景走 passwordless，没密码就直接等 OTP）
+            if password:
+                try:
+                    page.wait_for_selector('input[type="password"]', state="visible", timeout=15000)
+                    pwd_input = page.query_selector('input[type="password"]:visible')
+                    pwd_input.click(); time.sleep(0.3)
+                    pwd_input.fill(password)
+                    time.sleep(random.uniform(0.5, 1.2))
+                    clicked_pwd_continue = _click_first_visible([
+                        'button[type="submit"]',
+                        'button:has-text("Continue")',
+                        'button:has-text("Log in")',
+                        'button:has-text("Sign in")',
+                        '[data-testid*="continue"]',
+                        '[data-testid*="submit"]',
+                    ], "密码提交")
+                    if not clicked_pwd_continue:
+                        try:
+                            pwd_input.press("Enter")
+                            _log("      [RT] 密码提交: Enter")
+                        except Exception:
+                            pass
+                    time.sleep(5)
+                except Exception as e:
+                    _log(f"      [RT] 密码框超时（passwordless 路径），跳过到 OTP 等待: {str(e)[:80]}")
+                    _safe_screenshot(page, "/tmp/rt_pwd_skip.png")
+            else:
+                _log("      [RT] 数据库无 password，按 passwordless/OTP 路径继续")
 
             # [4] 处理 OTP / Turnstile / 各种中间页
             _log(f"      [RT] 密码后 URL: {page.url[:120]}")
@@ -5753,9 +6616,15 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                             target_email=email,
                             timeout=180,
                             issued_after=otp_sent_ts,
+                            mail_cfg=mail_cfg,
                         )
                         if not otp_code:
                             _log("      [RT] OTP 获取超时")
+                            _mark_registered_account_status_by_email(
+                                email,
+                                "UN_OAUTHED",
+                                "final email OTP timeout",
+                            )
                             return ""
                         _log(f"      [RT] OTP 已获取 (len={len(otp_code)})")
                         # 填入 OTP
@@ -6937,8 +7806,9 @@ def _handle_paypal_redirect(
     # ── 创建 HTTP session (curl_cffi Chrome 指纹) ──
     try:
         from curl_cffi.requests import Session as CffiSession
-        http = CffiSession(impersonate="chrome136")
-        _log("      [PayPal] 使用 curl_cffi (chrome136 TLS 指纹)")
+        impersonate = _curl_cffi_impersonate_for_user_agent(USER_AGENT)
+        http = CffiSession(impersonate=impersonate)
+        _log(f"      [PayPal] 使用 curl_cffi ({impersonate} TLS 指纹)")
     except ImportError:
         http = requests.Session()
         _log("      [PayPal] curl_cffi 不可用，使用 requests (TLS 指纹暴露风险)")
@@ -8612,6 +9482,8 @@ def run(
             _log(f"        - {stage_name}: {_describe_proxy_cfg(stage_proxy_cfg.get(stage_name))}")
 
     preseeded_fp = _resolve_preseeded_stripe_fingerprint(cfg)
+    if preseeded_fp:
+        locale_profile = _locale_profile_from_stripe_fingerprint(locale_profile, preseeded_fp)
     preseeded_user_agent = preseeded_fp.get("user_agent", "") if preseeded_fp else ""
     if preseeded_fp:
         if preseeded_user_agent:
@@ -8674,6 +9546,26 @@ def run(
                 f"total={pricing.get('total')} "
                 f"currency={pricing.get('currency') or '?'}"
             )
+            actual_due_for_trial = pricing.get("due")
+            if actual_due_for_trial not in (None, 0):
+                result = {
+                    "state": "no_trial",
+                    "error": "total_summary.due is not 0",
+                    "session_id": session_id,
+                    "total_summary": pricing,
+                }
+                _record_result(
+                    status="no_trial",
+                    chatgpt_email=fresh_cfg.get("_chatgpt_email", card.get("email", "")),
+                    session_id=session_id,
+                    payment_channel="gopay" if use_gopay else ("paypal" if use_paypal else "card"),
+                    processor_entity=init_resp.get("account_settings", {}).get("display_name", ""),
+                    config_path=resolved_config_path,
+                    error_msg=f"total_summary.due={actual_due_for_trial}",
+                )
+                _log("      total_summary.due 非 0，标记为 no_trial 并停止支付")
+                _log(f"\n日志已保存到: {LOG_FILE}")
+                return result
             if expected_due is not None:
                 actual_due = pricing.get("due")
                 if actual_due is None:
@@ -9211,6 +10103,8 @@ def run(
     chatgpt_email = fresh_cfg.get("_chatgpt_email", card.get("email", ""))
     payment_channel = "gopay" if use_gopay else ("paypal" if use_paypal else "card")
     result_state = result.get("state", "unknown")
+    if isinstance(init_ctx.get("pricing"), dict):
+        result.setdefault("total_summary", init_ctx.get("pricing"))
 
     # 从数据库查最近一条匹配 email 的账号凭证。
     extra_info = {}
@@ -9251,7 +10145,7 @@ def run(
                 except Exception as e:
                     _log(f"      [RT] 读取 mail 配置失败: {e}")
 
-            if _password and _mail_cfg:
+            if _mail_cfg:
                 _log("      [RT] 支付成功，重新登录捕获 Codex localhost callback ...")
                 rt_value = _exchange_refresh_token_with_session(
 	                    email=chatgpt_email,
@@ -9294,8 +10188,13 @@ def run(
                         _log(f"      [RT] CPA token JSON 已保存: {token_path}")
                 else:
                     _log("      [RT] ❌ callback 获取失败（不影响支付结果）")
+                    _mark_registered_account_status_by_email(
+                        chatgpt_email,
+                        "UN_OAUTHED",
+                        "final callback capture failed",
+                    )
             else:
-                _log(f"      [RT] 缺少条件，跳过 (password={bool(_password)} mail_cfg={bool(_mail_cfg)})")
+                _log(f"      [RT] 缺少条件，跳过 (mail_cfg={bool(_mail_cfg)})")
         except Exception as e:
             _log(f"      [RT] 获取异常: {e}")
 

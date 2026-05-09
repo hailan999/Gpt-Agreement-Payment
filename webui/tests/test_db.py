@@ -58,3 +58,14 @@ def test_clear_runtime_data_preserves_durable_runtime_config(db):
     assert db.get_runtime_json("wa_session_snapshot", {})["data"] == "snapshot"
     assert db.get_runtime_json("daemon_state", {}) == {}
     assert db.get_runtime_json("wa_state", {}) == {}
+
+
+def test_find_latest_registered_account_includes_id_for_status_update(db):
+    db.add_registered_account({"email": "a@example.com", "status": "INITIAL"})
+    db.add_registered_account({"email": "a@example.com", "status": "SUCCESS"})
+
+    latest = db.find_latest_registered_account("a@example.com")
+
+    assert latest["id"] == db.iter_registered_accounts()[-1]["id"]
+    assert db.update_registered_account_status(latest["id"], "UN_OAUTHED") is True
+    assert db.find_latest_registered_account("a@example.com")["status"] == "UN_OAUTHED"

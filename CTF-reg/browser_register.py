@@ -217,6 +217,67 @@ def _parse_proxy(proxy_url: str):
     }
 
 
+def _log_page_fingerprint(page, label: str) -> None:
+    """Print the effective browser fingerprint visible to the page."""
+    try:
+        fp = page.evaluate(
+            """() => ({
+                userAgent: navigator.userAgent,
+                language: navigator.language,
+                languages: Array.from(navigator.languages || []),
+                platform: navigator.platform,
+                vendor: navigator.vendor,
+                hardwareConcurrency: navigator.hardwareConcurrency,
+                deviceMemory: navigator.deviceMemory,
+                webdriver: navigator.webdriver,
+                maxTouchPoints: navigator.maxTouchPoints,
+                cookieEnabled: navigator.cookieEnabled,
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                timezoneOffset: new Date().getTimezoneOffset(),
+                screen: {
+                    width: screen.width,
+                    height: screen.height,
+                    availWidth: screen.availWidth,
+                    availHeight: screen.availHeight,
+                    colorDepth: screen.colorDepth,
+                    pixelDepth: screen.pixelDepth
+                },
+                viewport: {
+                    width: window.innerWidth,
+                    height: window.innerHeight,
+                    devicePixelRatio: window.devicePixelRatio
+                }
+            })"""
+        )
+    except Exception as e:
+        logger.info(f"[browser-reg] 指纹({label}) 读取失败: {e}")
+        return
+
+    screen = fp.get("screen") or {}
+    viewport = fp.get("viewport") or {}
+    languages = ",".join(fp.get("languages") or [])
+    logger.info(
+        f"[browser-reg] 指纹({label}) UA: {fp.get('userAgent', '')}"
+    )
+    logger.info(
+        f"[browser-reg] 指纹({label}) 环境: "
+        f"language={fp.get('language', '')} languages={languages} "
+        f"platform={fp.get('platform', '')} vendor={fp.get('vendor', '')} "
+        f"timezone={fp.get('timezone', '')} tz_offset={fp.get('timezoneOffset', '')} "
+        f"webdriver={fp.get('webdriver', '')} cookie={fp.get('cookieEnabled', '')}"
+    )
+    logger.info(
+        f"[browser-reg] 指纹({label}) 屏幕: "
+        f"screen={screen.get('width', '')}x{screen.get('height', '')} "
+        f"avail={screen.get('availWidth', '')}x{screen.get('availHeight', '')} "
+        f"viewport={viewport.get('width', '')}x{viewport.get('height', '')} "
+        f"dpr={viewport.get('devicePixelRatio', '')} "
+        f"color_depth={screen.get('colorDepth', '')} pixel_depth={screen.get('pixelDepth', '')} "
+        f"cpu={fp.get('hardwareConcurrency', '')} memory={fp.get('deviceMemory', '')} "
+        f"touch={fp.get('maxTouchPoints', '')}"
+    )
+
+
 def browser_register(cfg, mail_provider) -> dict:
     """
     用真实浏览器走注册流程。
@@ -242,6 +303,12 @@ def browser_register(cfg, mail_provider) -> dict:
 
     tmp_profile = tempfile.mkdtemp(prefix="chatgpt_reg_")
     logger.info(f"[browser-reg] 临时 profile: {tmp_profile}")
+    logger.info(
+        "[browser-reg] Camoufox 启动参数: "
+        f"headless={not has_display} humanize=True os=windows "
+        f"screen_max=1920x1080 proxy={'yes' if cf_proxy else 'no'} "
+        f"geoip={bool(getattr(cfg, 'camoufox_geoip', True))} locale=en-US"
+    )
 
     result = {
         "email": email,
@@ -268,10 +335,12 @@ def browser_register(cfg, mail_provider) -> dict:
             locale="en-US",
         ) as ctx:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            _log_page_fingerprint(page, "启动后")
 
             # [1] 打开 ChatGPT 首页，点 "Sign up for free"
             logger.info("[browser-reg] 打开 ChatGPT 首页 ...")
             _goto_with_retry(page, "https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+            _log_page_fingerprint(page, "chatgpt.com")
             # 等 React 渲染完成 + Sign up 按钮可交互
             try:
                 page.wait_for_selector('button[data-testid="signup-button"], a[data-testid="signup-button"]',

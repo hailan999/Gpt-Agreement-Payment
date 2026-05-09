@@ -829,7 +829,7 @@ def pay(card_config_path, session_token=None, access_token=None,
 
         tmp_config = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", prefix="pipeline_pay_",
-            dir=str(CARD_DIR), delete=False, encoding="utf-8",
+            dir=str(OUTPUT_DIR), delete=False, encoding="utf-8",
         )
         json.dump(cfg, tmp_config, ensure_ascii=False, indent=2)
         tmp_config.close()
@@ -1184,21 +1184,28 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
     # ── pay-only batch：每次 pay_only（复用未付账号），串行
     if is_pay_only:
         print(f"\n[batch] === pay-only × {count} 串行 ===")
+        proxy_pool = _build_proxy_pool_from_card_cfg(card_cfg)
+        if proxy_pool.proxies:
+            print(f"[ProxyPool] 代理池大小={len(proxy_pool.proxies)}  rotation={proxy_pool.rotation}")
         results = []
         ok_count = 0
         for i in range(count):
             print(f"\n{'#'*60}\n# 批次 {i+1}/{count}  (pay-only)\n{'#'*60}")
             try:
-                pipeline_fingerprint = _register_pipeline_start_fingerprint(card_cfg or {}, "")
+                picked_proxy = proxy_pool.pick() if proxy_pool and proxy_pool.proxies else ""
+                if picked_proxy:
+                    print(f"[ProxyPool] 本次代理: {picked_proxy}")
                 r = pay_only(
                     card_config_path,
                     use_paypal=use_paypal, use_gopay=use_gopay,
                     gopay_otp_file=gopay_otp_file,
-                    stripe_fingerprint=pipeline_fingerprint,
+                    proxy_url=picked_proxy,
                 )
                 r["batch_index"] = i
                 if isinstance(r, dict):
+                    pipeline_fingerprint = r.get("stripe_fingerprint") or {}
                     r["stripe_fingerprint"] = pipeline_fingerprint
+                    r["proxy"] = r.get("proxy") or picked_proxy
                 if r.get("status") == "succeeded":
                     ok_count += 1
             except Exception as e:
@@ -1408,13 +1415,57 @@ def _paid_or_consumed_emails() -> set[str]:
     return consumed
 
 
-def _select_recent_registered_account_for_pay_only() -> dict | None:
-    """Pick the newest registered account that has not already succeeded.
+def _registered_account_status(acc: dict) -> str:
+    return str(acc.get("status") or "INITIAL").strip().upper()
 
-    This makes `--pay-only` useful for the common case where registration
-    completed but payment was blocked by captcha/OTP/DataDome/etc.  The selected
-    account is returned with its original session/access/device credentials.
+
+def _payment_account_status(result: dict | None) -> str:
+    if not isinstance(result, dict):
+        return "FAILED"
+    status = str(result.get("status") or "").strip().lower()
+    raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
+    total_summary = raw.get("total_summary") if isinstance(raw.get("total_summary"), dict) else {}
+    due = total_summary.get("due")
+    if status == "succeeded":
+        return "SUCCESS"
+    if status == "no_trial":
+        return "NO_TRIAL"
+    if due not in (None, "", 0):
+        return "NO_TRIAL"
+    return "FAILED"
+
+
+def _mark_registered_account_status(account: dict | None, status: str) -> None:
+    if not account:
+        return
+    account_id = account.get("id")
+    if not account_id:
+        return
+    try:
+        get_db().update_registered_account_status(int(account_id), status)
+    except Exception as e:
+        print(f"[pay-only] 更新账号状态失败 id={account_id}: {e}")
+
+
+def _current_registered_account_status(account: dict | None) -> str:
+    if not account:
+        return ""
+    account_id = account.get("id")
+    if not account_id:
+        return ""
+    try:
+        return str(get_db().get_registered_account(int(account_id)).get("status") or "").strip().upper()
+    except Exception:
+        return ""
+
+
+def _select_recent_registered_account_for_pay_only(target_email: str = "") -> dict | None:
+    """Pick the newest registered account whose status is INITIAL.
+
+    The selected account is returned with its original
+    session/access/device credentials from SQLite.
     """
+    target_email = _norm_email(target_email)
     accounts = _load_registered_accounts()
     if not accounts:
         return None
@@ -1427,7 +1478,11 @@ def _select_recent_registered_account_for_pay_only() -> dict | None:
         email = _norm_email(acc.get("email"))
         if not email or email in seen:
             continue
+        if target_email and email != target_email:
+            continue
         seen.add(email)
+        if _registered_account_status(acc) != "INITIAL":
+            continue
         if email in consumed:
             continue
         if not (acc.get("session_token") or acc.get("access_token")):
@@ -1440,26 +1495,28 @@ def _select_recent_registered_account_for_pay_only() -> dict | None:
 
 def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
              gopay_otp_file=None, timeout_pay=600, prefer_recent=True,
-             stripe_fingerprint=None):
+             stripe_fingerprint=None, proxy_url=""):
     """Retry payment only.
 
     Default behavior is now:
-      1. use the newest account in SQLite storage that has not
-         already succeeded/been consumed;
-      2. fall back to credentials embedded in the payment config if no reusable
-         account exists.
-
-    This preserves the old config-token path while preventing freshly
-    registered-but-unpaid accounts from being wasted.
+      1. use the newest INITIAL account in SQLite storage;
+      2. use session_token/access_token from that registered_accounts row only.
     """
-    account = _select_recent_registered_account_for_pay_only() if prefer_recent else None
-    email = _norm_email(account.get("email")) if account else ""
     try:
         card_cfg = _read_card_cfg(card_config_path)
     except Exception:
         card_cfg = {}
+    fixed_pay_email = _norm_email(
+        ((card_cfg.get("pay_only") or {}).get("email") if isinstance(card_cfg.get("pay_only"), dict) else "")
+    )
+    account = _select_recent_registered_account_for_pay_only(fixed_pay_email) if prefer_recent else None
+    email = _norm_email(account.get("email")) if account else fixed_pay_email
+    account_proxy = str((account or {}).get("proxy_add") or "").strip()
+    selected_proxy = account_proxy or str(proxy_url or "").strip()
+    if fixed_pay_email:
+        print(f"[pay-only] 固定测试邮箱: {fixed_pay_email}")
     if stripe_fingerprint is None:
-        stripe_fingerprint = _register_pipeline_start_fingerprint(card_cfg or {}, "")
+        stripe_fingerprint = _register_pipeline_start_fingerprint(card_cfg or {}, selected_proxy)
     if account:
         print(
             "[pay-only] 复用最近未支付注册账号: "
@@ -1468,8 +1525,18 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
             f"access_token={'yes' if account.get('access_token') else 'no'} "
             f"device_id={'yes' if account.get('device_id') else 'no'}"
         )
+        if account_proxy:
+            proxy_pool = _build_proxy_pool_from_card_cfg(card_cfg or {})
+            matched = _proxy_in_pool(account_proxy, proxy_pool)
+            print(
+                "[pay-only] 使用注册账号原代理: "
+                f"{account_proxy} "
+                f"pool_match={'yes' if matched else 'no'}"
+            )
+        elif selected_proxy:
+            print(f"[pay-only] 账号无 proxy_add，使用本次代理池代理: {selected_proxy}")
     else:
-        print("[pay-only] 未找到可复用注册账号，回退使用 config 里的 session_token/access_token")
+        raise PaymentError("[pay-only] 未找到 status=INITIAL 且带 session_token/access_token 的注册账号")
 
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -1477,12 +1544,21 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
         "registration": {"status": "reused" if account else "config", "email": email},
         "payment": {},
         "domain": email.split("@", 1)[1] if "@" in email else "",
-        "proxy": "",
+        "proxy": selected_proxy,
         "stripe_fingerprint": stripe_fingerprint or {},
     }
+    effective_card_config_path = card_config_path
+    temp_card = None
+    if selected_proxy:
+        temp_card = _rewrite_card_with_proxy(
+            card_config_path,
+            selected_proxy,
+            stripe_fingerprint=stripe_fingerprint,
+        )
+        effective_card_config_path = temp_card
     try:
         result = pay(
-            card_config_path,
+            effective_card_config_path,
             session_token=account.get("session_token") if account else None,
             access_token=account.get("access_token") if account else None,
             device_id=account.get("device_id", "") if account else None,
@@ -1496,6 +1572,12 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
         raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
         pay_email = _norm_email(email or raw.get("chatgpt_email") or raw.get("email"))
         record["payment"] = {"status": status, "email": pay_email}
+        account_status = _payment_account_status(result)
+        if account_status == "NO_TRIAL":
+            record["payment"]["error"] = "total_summary.due is not 0"
+        if account_status == "SUCCESS" and _current_registered_account_status(account) == "UN_OAUTHED":
+            account_status = "UN_OAUTHED"
+        _mark_registered_account_status(account, account_status)
         cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
         if use_gopay and status != "succeeded":
             _gopay_unlink_after_flow_failure(pay_email, cpa_cfg, status)
@@ -1508,14 +1590,24 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
                 print(f"[CPA] 导入异常: {e}")
                 record["cpa_import"] = "error"
         _append_result(record)
+        if isinstance(result, dict):
+            result["proxy"] = selected_proxy
+            result["stripe_fingerprint"] = stripe_fingerprint or {}
         return result
     except PaymentError as e:
         record["payment"] = {"status": "error", "email": email, "error": str(e)[:200]}
+        _mark_registered_account_status(account, "FAILED")
         if use_gopay:
             cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
             _gopay_unlink_after_flow_failure(email, cpa_cfg, str(e)[:120])
         _append_result(record)
         raise
+    finally:
+        if temp_card and os.path.exists(temp_card):
+            try:
+                os.unlink(temp_card)
+            except Exception:
+                pass
 
 
 # ──────────────────────────────────────────────
@@ -2636,11 +2728,66 @@ class ProxyPool:
         pass
 
 
+def _normalize_proxy_url_for_match(proxy_url: str) -> str:
+    value = str(proxy_url or "").strip()
+    if not value:
+        return ""
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        parsed = urlsplit(value if "://" in value else f"http://{value}")
+        scheme = (parsed.scheme or "http").lower()
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+        userinfo = ""
+        if parsed.username:
+            userinfo = parsed.username
+            if parsed.password:
+                userinfo += f":{parsed.password}"
+            userinfo += "@"
+        netloc = f"{userinfo}{host}"
+        if port:
+            netloc += f":{port}"
+        return urlunsplit((scheme, netloc, "", "", ""))
+    except Exception:
+        return value.lower()
+
+
+def _proxy_in_pool(proxy_url: str, proxy_pool: "ProxyPool") -> bool:
+    target = _normalize_proxy_url_for_match(proxy_url)
+    if not target or not proxy_pool or not proxy_pool.proxies:
+        return False
+    return target in {_normalize_proxy_url_for_match(p) for p in proxy_pool.proxies}
+
+
 def _build_proxy_pool_from_card_cfg(card_cfg) -> "ProxyPool":
     pp = (card_cfg or {}).get("proxies") or {}
     if not pp.get("enabled"):
         return ProxyPool()
-    return ProxyPool(proxies=pp.get("list", []), rotation=pp.get("rotation", "static"))
+    proxies = list(pp.get("list", []) or [])
+    source_file = str(pp.get("source_file") or "").strip()
+    if source_file:
+        proxy_path = Path(source_file)
+        if not proxy_path.is_absolute():
+            proxy_path = Path(__file__).resolve().parent / proxy_path
+        try:
+            for line in proxy_path.read_text(encoding="utf-8").splitlines():
+                raw = line.strip()
+                if not raw or raw.startswith("#"):
+                    continue
+                if "://" in raw:
+                    proxies.append(raw)
+                    continue
+                parts = raw.split(":")
+                if len(parts) < 4:
+                    print(f"[ProxyPool] 跳过无法解析的代理行: {raw}")
+                    continue
+                host, port = parts[0], parts[1]
+                password = parts[-1]
+                username = ":".join(parts[2:-1])
+                proxies.append(f"http://{username}:{password}@{host}:{port}")
+        except Exception as e:
+            print(f"[ProxyPool] 读取代理文件失败 {proxy_path}: {e}")
+    return ProxyPool(proxies=proxies, rotation=pp.get("rotation", "static"))
 
 
 STRIPE_FINGERPRINT_USER_AGENT_POOL = [
@@ -2688,7 +2835,7 @@ def _rewrite_cardw_with_domain(src_path, domain, proxy_url=""):
         data["proxy"] = proxy_url
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", prefix="pipeline_cardw_",
-        dir=str(CARDW_DIR), delete=False, encoding="utf-8",
+        dir=str(OUTPUT_DIR), delete=False, encoding="utf-8",
     )
     json.dump(data, tmp, ensure_ascii=False, indent=2)
     tmp.close()
@@ -2705,7 +2852,7 @@ def _rewrite_card_with_proxy(src_path, proxy_url="", stripe_fingerprint=None):
         data["stripe_fingerprint"] = stripe_fingerprint
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", prefix="pipeline_pay_px_",
-        dir=str(CARD_DIR), delete=False, encoding="utf-8",
+        dir=str(OUTPUT_DIR), delete=False, encoding="utf-8",
     )
     json.dump(data, tmp, ensure_ascii=False, indent=2)
     tmp.close()
@@ -2732,7 +2879,18 @@ def _register_pipeline_start_fingerprint(card_cfg: dict, proxy_url: str = "") ->
         except Exception:
             locale_profile = {}
         browser_locale = locale_profile.get("browser_locale") or "en-US"
+        browser_timezone = locale_profile.get("browser_timezone") or ""
+        browser_language = locale_profile.get("browser_language") or browser_locale
+        screen_w = locale_profile.get("screen_w") or ""
+        screen_h = locale_profile.get("screen_h") or ""
+        dpr = locale_profile.get("dpr") or ""
+        color_depth = locale_profile.get("color_depth") or ""
         user_agent = random.choice(STRIPE_FINGERPRINT_USER_AGENT_POOL)
+        accept_language = ""
+        try:
+            accept_language = card_mod._accept_language_for_locale(browser_locale)
+        except Exception:
+            accept_language = "en-US,en;q=0.9"
 
         http = requests.Session()
         try:
@@ -2749,11 +2907,33 @@ def _register_pipeline_start_fingerprint(card_cfg: dict, proxy_url: str = "") ->
                 http.proxies = {"http": effective_proxy, "https": effective_proxy}
 
         guid, muid, sid = card_mod.register_fingerprint(http)
+        actual_profile = getattr(http, "_stripe_fingerprint_profile", {}) or {}
+        actual_screen = actual_profile.get("screen") if isinstance(actual_profile.get("screen"), dict) else {}
+        if actual_screen:
+            screen_w = actual_screen.get("width", screen_w)
+            screen_h = actual_screen.get("height", screen_h)
+            dpr = actual_screen.get("dpr", dpr)
+            color_depth = actual_screen.get("color_depth", color_depth)
         fp = {
             "guid": guid,
             "muid": muid,
             "sid": sid,
-            "user_agent": user_agent,
+            "user_agent": actual_profile.get("user_agent") or user_agent,
+            "accept_language": accept_language,
+            "browser_locale": browser_locale,
+            "browser_language": browser_language,
+            "browser_timezone": browser_timezone,
+            "screen": {
+                "width": screen_w,
+                "height": screen_h,
+                "viewport_width": actual_screen.get("viewport_width", screen_w),
+                "viewport_height": actual_screen.get("viewport_height", screen_h),
+                "dpr": dpr,
+                "color_depth": color_depth,
+            },
+            "platform": actual_profile.get("platform") or "Win32",
+            "cpu": actual_profile.get("cpu") or "",
+            "plugins": actual_profile.get("plugins") or "",
             "created_at": datetime.now(timezone.utc).isoformat(),
             "source": "pipeline_start",
         }
@@ -2761,6 +2941,14 @@ def _register_pipeline_start_fingerprint(card_cfg: dict, proxy_url: str = "") ->
             "[pipeline] 起始指纹: "
             f"guid={guid[:20]}... muid={muid[:20]}... sid={sid[:20]}... "
             f"ua=Chrome/{user_agent.split('Chrome/', 1)[-1].split(' ', 1)[0]}"
+        )
+        print(
+            "[pipeline] 起始浏览器指纹详情: "
+            f"ua={fp['user_agent']} | accept_language={accept_language} | "
+            f"locale={browser_locale} language={browser_language} timezone={browser_timezone} | "
+            f"screen={screen_w}x{screen_h} "
+            f"viewport={fp['screen'].get('viewport_width')}x{fp['screen'].get('viewport_height')} "
+            f"dpr={dpr} color_depth={color_depth}"
         )
         return fp
     except Exception as e:
@@ -3878,11 +4066,18 @@ def main():
             print(json.dumps(result, ensure_ascii=False, indent=2))
 
         elif args.pay_only:
+            with open(args.config, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            proxy_pool = _build_proxy_pool_from_card_cfg(cfg)
+            picked_proxy = proxy_pool.pick() if proxy_pool and proxy_pool.proxies else ""
+            if picked_proxy:
+                print(f"[ProxyPool] 本次代理: {picked_proxy}")
             result = pay_only(
                 args.config,
                 use_paypal=args.paypal,
                 use_gopay=args.gopay,
                 gopay_otp_file=args.gopay_otp_file,
+                proxy_url=picked_proxy,
             )
             print(f"\n结果: {result.get('status', '?')}")
 

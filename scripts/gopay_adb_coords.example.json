@@ -1,6 +1,7 @@
 {
   "adb_path": "adb",
   "device": "",
+  "adb_timeout_s": 15,
   "screenshot_dir": "output/gopay_adb_screenshots",
   "default_wait_seconds": 1.2,
   "coords": {
@@ -69,12 +70,17 @@
     ],
     "unlink_first_app_from_account_settings": [
       {"screenshot": "01_account_settings_before"},
-      {"tap": "linked_apps"},
-      {"wait": 2.0},
+      {"back_if_title_present": ["Linked apps"], "wait_after": 1.0},
+      {"tap_if_text_present": "linked_apps", "text": ["Account & app settings"], "wait_after": 2.0},
       {"screenshot": "02_linked_apps_before_unlink"},
+      {"tap_text_if_present": ["Retry"], "repeat": 2, "wait_after": 3.0},
+      {"fail_if_text": ["There's a technical error", "technical error"]},
+      {"fail_if_text": ["No apps linked to your GoPay", "No apps linked"]},
       {"tap": "first_linked_app_unlink"},
       {"wait": 1.5},
       {"screenshot": "03_unlink_confirm_dialog"},
+      {"fail_if_text": ["No apps linked to your GoPay", "No apps linked"]},
+      {"fail_unless_text": ["Unlink OpenAI LLC from GoPay", "Once unlinked"]},
       {"tap": "confirm_unlink"},
       {"wait": 2.0},
       {"screenshot": "04_after_unlink"},
@@ -84,6 +90,8 @@
     ],
     "unlink_first_app_from_list": [
       {"screenshot": "01_linked_apps_before_unlink"},
+      {"tap_text_if_present": ["Retry"], "repeat": 2, "wait_after": 3.0},
+      {"fail_if_text": ["There's a technical error", "technical error"]},
       {"pause": "Confirm the first app row is the app you want to unlink, then press Enter."},
       {"tap": "first_linked_app_unlink"},
       {"wait": 1.5},

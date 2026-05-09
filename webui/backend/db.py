@@ -70,6 +70,10 @@ CREATE TABLE IF NOT EXISTS registered_accounts (
   id_token TEXT DEFAULT '',
   refresh_token TEXT DEFAULT '',
   cookie_header TEXT DEFAULT '',
+  proxy_add TEXT DEFAULT '',
+  hot_client TEXT DEFAULT '',
+  hot_rt TEXT DEFAULT '',
+  status TEXT DEFAULT 'INITIAL',
   created_at REAL NOT NULL,
   last_check_at REAL DEFAULT 0,
   last_check_status TEXT DEFAULT '',
@@ -179,6 +183,14 @@ class Database:
             c.execute("ALTER TABLE registered_accounts ADD COLUMN last_check_status TEXT DEFAULT ''")
         if "last_check_message" not in existing_acc:
             c.execute("ALTER TABLE registered_accounts ADD COLUMN last_check_message TEXT DEFAULT ''")
+        if "status" not in existing_acc:
+            c.execute("ALTER TABLE registered_accounts ADD COLUMN status TEXT DEFAULT 'INITIAL'")
+        if "proxy_add" not in existing_acc:
+            c.execute("ALTER TABLE registered_accounts ADD COLUMN proxy_add TEXT DEFAULT ''")
+        if "hot_client" not in existing_acc:
+            c.execute("ALTER TABLE registered_accounts ADD COLUMN hot_client TEXT DEFAULT ''")
+        if "hot_rt" not in existing_acc:
+            c.execute("ALTER TABLE registered_accounts ADD COLUMN hot_rt TEXT DEFAULT ''")
 
     # ──────────────────────────────────────────
     # Runtime data store. SQLite is the only source of truth for runtime data.
@@ -281,8 +293,9 @@ class Database:
                 """
                 INSERT INTO registered_accounts(
                   email, ts, password, session_token, access_token, device_id,
-                  csrf_token, id_token, refresh_token, cookie_header, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  csrf_token, id_token, refresh_token, cookie_header, proxy_add,
+                  hot_client, hot_rt, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     email,
@@ -295,6 +308,10 @@ class Database:
                     _text(row.get("id_token")),
                     _text(row.get("refresh_token")),
                     _text(row.get("cookie_header")),
+                    _text(row.get("proxy_add")),
+                    _text(row.get("hot_client")),
+                    _text(row.get("hot_rt")),
+                    _text(row.get("status") or "INITIAL"),
                     time.time(),
                 ),
             )
@@ -306,6 +323,7 @@ class Database:
                 """
                 SELECT id, email, ts, password, session_token, access_token, device_id,
                        csrf_token, id_token, refresh_token, cookie_header,
+                       proxy_add, hot_client, hot_rt, status,
                        last_check_at, last_check_status, last_check_message
                 FROM registered_accounts
                 ORDER BY id ASC
@@ -319,12 +337,47 @@ class Database:
                 """
                 SELECT id, email, ts, password, session_token, access_token, device_id,
                        csrf_token, id_token, refresh_token, cookie_header,
+                       proxy_add, hot_client, hot_rt, status,
                        last_check_at, last_check_status, last_check_message
                 FROM registered_accounts WHERE id = ?
                 """,
                 (int(account_id),),
             ).fetchone()
         return dict(row) if row else {}
+
+    def update_registered_account_status(self, account_id: int, status: str) -> bool:
+        status = _text(status).strip().upper()
+        if not status:
+            return False
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE registered_accounts SET status = ? WHERE id = ?",
+                (status, int(account_id)),
+            )
+        return cur.rowcount > 0
+
+    def update_registered_account_hotmail_refresh_token(self, email: str, refresh_token: str) -> bool:
+        target = _email(email)
+        refresh_token = _text(refresh_token)
+        if not target or not refresh_token:
+            return False
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT id FROM registered_accounts
+                WHERE email = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (target,),
+            ).fetchone()
+            if not row:
+                return False
+            cur = c.execute(
+                "UPDATE registered_accounts SET hot_rt = ? WHERE id = ?",
+                (refresh_token, row["id"]),
+            )
+        return cur.rowcount > 0
 
     def update_account_check(self, account_id: int, status: str, message: str = "") -> bool:
         """Record validity probe outcome (status: 'valid' | 'invalid' | 'unknown')."""
@@ -361,8 +414,9 @@ class Database:
         with self._conn() as c:
             row = c.execute(
                 """
-                SELECT email, ts, password, session_token, access_token, device_id,
-                       csrf_token, id_token, refresh_token, cookie_header
+                SELECT id, email, ts, password, session_token, access_token, device_id,
+                       csrf_token, id_token, refresh_token, cookie_header,
+                       proxy_add, hot_client, hot_rt, status
                 FROM registered_accounts
                 WHERE email = ?
                 ORDER BY id DESC
