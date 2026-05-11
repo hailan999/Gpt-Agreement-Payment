@@ -75,7 +75,7 @@ def test_pay_only_treats_already_paid_error_as_consumed(tmp_path, monkeypatch):
     assert selected["email"] == "older@example.com"
 
 
-def test_pay_only_success_imports_cpa_with_plus_tag(tmp_path, monkeypatch):
+def test_pay_only_success_without_rt_marks_un_oauthed_and_skips_cpa(tmp_path, monkeypatch):
     db = _reset_db(tmp_path, monkeypatch)
     card_config = tmp_path / "config.paypal.json"
 
@@ -96,8 +96,6 @@ def test_pay_only_success_imports_cpa_with_plus_tag(tmp_path, monkeypatch):
         },
     }), encoding="utf-8")
 
-    calls = []
-
     def fake_pay(*args, **kwargs):
         return {
             "status": "succeeded",
@@ -108,8 +106,7 @@ def test_pay_only_success_imports_cpa_with_plus_tag(tmp_path, monkeypatch):
         }
 
     def fake_cpa(email, sid, cpa_cfg, **kwargs):
-        calls.append((email, sid, cpa_cfg, kwargs))
-        return "ok"
+        raise AssertionError("pay-only must not import CPA")
 
     monkeypatch.setattr(pipeline, "pay", fake_pay)
     monkeypatch.setattr(pipeline, "_cpa_import_after_team", fake_cpa)
@@ -117,15 +114,74 @@ def test_pay_only_success_imports_cpa_with_plus_tag(tmp_path, monkeypatch):
     result = pipeline.pay_only(str(card_config), use_gopay=True)
 
     assert result["status"] == "succeeded"
-    assert calls
-    email, sid, cpa_cfg, kwargs = calls[0]
-    assert email == "retry@example.com"
-    assert sid == "cs_test"
-    assert cpa_cfg["plan_tag"] == "plus"
     rows = get_db().iter_pipeline_results()
-    assert rows[-1]["cpa_import"] == "ok"
+    assert "cpa_import" not in rows[-1]
     accounts = get_db().iter_registered_accounts()
-    assert accounts[-1]["status"] == "SUCCESS"
+    assert accounts[-1]["status"] == "UN_OAUTHED"
+
+
+def test_pay_only_tells_card_to_skip_post_payment_rt(tmp_path, monkeypatch):
+    db = _reset_db(tmp_path, monkeypatch)
+    card_config = tmp_path / "config.paypal.json"
+    card_config.write_text("{}", encoding="utf-8")
+
+    db.add_registered_account({
+        "email": "skip-rt@example.com",
+        "session_token": "sess-skip",
+        "access_token": "at-skip",
+    })
+
+    seen = {}
+
+    def fake_pay(*args, **kwargs):
+        seen["skip_post_payment_rt"] = kwargs.get("skip_post_payment_rt")
+        return {
+            "status": "succeeded",
+            "raw": {
+                "session_id": "cs_test",
+                "chatgpt_email": "skip-rt@example.com",
+            },
+        }
+
+    monkeypatch.setattr(pipeline, "pay", fake_pay)
+
+    result = pipeline.pay_only(str(card_config))
+
+    assert result["status"] == "succeeded"
+    assert seen["skip_post_payment_rt"] is True
+
+
+def test_pay_only_success_with_rt_marks_success(tmp_path, monkeypatch):
+    db = _reset_db(tmp_path, monkeypatch)
+    card_config = tmp_path / "config.paypal.json"
+    card_config.write_text("{}", encoding="utf-8")
+
+    db.add_registered_account({
+        "email": "has-rt@example.com",
+        "session_token": "sess-rt",
+        "access_token": "at-rt",
+        "device_id": "dev-rt",
+    })
+
+    def fake_pay(*args, **kwargs):
+        row = get_db().find_latest_registered_account("has-rt@example.com")
+        get_db().update_registered_account_refresh_token(row["id"], "rt_test")
+        return {
+            "status": "succeeded",
+            "raw": {
+                "session_id": "cs_test",
+                "chatgpt_email": "has-rt@example.com",
+            },
+        }
+
+    monkeypatch.setattr(pipeline, "pay", fake_pay)
+
+    result = pipeline.pay_only(str(card_config))
+
+    assert result["status"] == "succeeded"
+    account = get_db().find_latest_registered_account("has-rt@example.com")
+    assert account["status"] == "SUCCESS"
+    assert account["refresh_token"] == "rt_test"
 
 
 def test_pay_only_selects_only_initial_accounts(tmp_path, monkeypatch):

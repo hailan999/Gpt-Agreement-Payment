@@ -186,6 +186,7 @@ def build_accounts_inventory() -> dict:
         "rt_missing": 0,
         "rt_processed": 0,
         "rt_retryable": 0,
+        "rt_backfill_candidates": 0,
         "rt_cooldown": 0,
         "rt_dead": 0,
         "status_success": 0,
@@ -227,7 +228,7 @@ def build_accounts_inventory() -> dict:
         elif account_status != "INITIAL":
             pay_state = "consumed"
         rt_state = _rt_state(has_rt, oauth)
-        can_backfill_rt = rt_state in ("missing", "retryable")
+        can_backfill_rt = account_status == "UN_OAUTHED" and rt_state in ("missing", "retryable")
 
         if has_auth:
             counts["with_auth"] += 1
@@ -249,6 +250,8 @@ def build_accounts_inventory() -> dict:
             counts["rt_dead"] += 1
         if rt_state == "missing":
             counts["rt_missing"] += 1
+        if can_backfill_rt:
+            counts["rt_backfill_candidates"] += 1
 
         plan_tag = _derive_plan_tag(email, paid=consumed, is_team=email in team_emails)
         cpa_status = cpa_status_by_email.get(email, "")

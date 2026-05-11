@@ -52,7 +52,7 @@
             <TermToggle v-model="form.register_only" :disabled="form.pay_only">--register-only</TermToggle>
           </div>
           <p v-if="!isFreeMode" class="ctl-hint">
-            <code>--pay-only</code> 跳过注册，优先复用最近注册但未支付账号；
+            <code>--pay-only</code> 只支付，成功缺 RT 会进入授权队列；
             <code>--register-only</code> 只注册不支付。
           </p>
           <p v-else class="ctl-hint">
@@ -181,7 +181,7 @@
             <div class="inventory-row-top">
               <input type="checkbox" class="inventory-row-check" :checked="isSelected(acc.id)" @change="toggleSelect(acc.id)" />
               <span class="inventory-email">{{ acc.email }}</span>
-              <span class="badge" :class="accountStatusBadgeClass(acc.account_status)">{{ acc.account_status }}</span>
+              <span class="badge" :class="accountStatusBadgeClass(acc.account_status)">{{ accountStatusLabel(acc.account_status) }}</span>
               <span class="badge" :class="planBadgeClass(acc.plan_tag)">{{ planLabel(acc.plan_tag) }}</span>
               <span class="badge" :class="checkBadgeClass(acc.last_check_status)" :title="acc.last_check_message">
                 <template v-if="checkingIds.has(acc.id)">⟳ 检查中</template>
@@ -204,7 +204,7 @@
               <span v-if="acc.oauth_status">oauth {{ acc.oauth_status }}<template v-if="acc.oauth_fail_reason"> ({{ acc.oauth_fail_reason }})</template></span>
               <span v-if="acc.oauth_cooldown_remaining_s">cooldown {{ formatCooldown(acc.oauth_cooldown_remaining_s) }}</span>
               <span v-if="acc.latest_payment_is_already_paid" class="inventory-inline-flag">already paid</span>
-              <span v-if="acc.can_backfill_rt" class="inventory-inline-flag">can backfill rt</span>
+              <span v-if="acc.can_backfill_rt" class="inventory-inline-flag">待授权</span>
             </div>
           </div>
         </div>
@@ -279,7 +279,7 @@ const modes = [
   { value: "self_dealer", label: "self-dealer" },
   { value: "daemon", label: "daemon ∞" },
   { value: "free_register", label: "free_register — 免费号+rt+CPA" },
-  { value: "free_backfill_rt", label: "free_backfill_rt — 老号补rt" },
+  { value: "free_backfill_rt", label: "free_backfill_rt — 授权/补RT" },
 ];
 
 import { useWizardStore } from "../stores/wizard";
@@ -478,7 +478,7 @@ const runStatusCounts = computed<Record<RunTerminalStatus, number>>(() => {
 });
 const runStatusItems = computed(() => [
   { key: "success", label: "SUCCESS", value: runStatusCounts.value.SUCCESS, className: "status-success" },
-  { key: "un_oauthed", label: "UN_OAUTHED", value: runStatusCounts.value.UN_OAUTHED, className: "status-un-oauthed" },
+  { key: "un_oauthed", label: "待授权", value: runStatusCounts.value.UN_OAUTHED, className: "status-un-oauthed" },
   { key: "add_phone", label: "ADD_PHONE", value: runStatusCounts.value.ADD_PHONE, className: "status-add-phone" },
   { key: "failed", label: "FAILED", value: runStatusCounts.value.FAILED, className: "status-failed" },
   { key: "no_trial", label: "NO_TRIAL", value: runStatusCounts.value.NO_TRIAL, className: "status-no-trial" },
@@ -570,6 +570,12 @@ function accountStatusBadgeClass(status: string) {
   if (s === "NO_TRIAL") return "badge-no-trial";
   if (s === "PROCESSING") return "badge-warn";
   return "badge-ghost";
+}
+
+function accountStatusLabel(status: string) {
+  const s = String(status || "").toUpperCase();
+  if (s === "UN_OAUTHED") return "待授权";
+  return s || "INITIAL";
 }
 
 function healthStatusLabel(status: ConfigHealthCheck["status"]) {

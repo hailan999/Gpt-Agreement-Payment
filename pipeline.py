@@ -17,7 +17,7 @@ Pipeline 调度器：注册 ChatGPT 账号 → Stripe/PayPal 支付
   python pipeline.py --pay-only --config CTF-pay/config.paypal.json --paypal
 
   # 批量
-  python pipeline.py --config CTF-pay/config.paypal.json --paypal --batch 5 --delay 30
+  python pipeline.py --config CTF-pay/config.paypal.json --paypal --batch 5
 """
 
 import argparse
@@ -788,7 +788,7 @@ def _cpa_cfg_for_card_payment(card_cfg: dict) -> dict:
 def pay(card_config_path, session_token=None, access_token=None,
         device_id=None, use_paypal=False, use_gopay=False,
         gopay_otp_file=None, python=None, timeout=600,
-        stripe_fingerprint=None):
+        stripe_fingerprint=None, skip_post_payment_rt=False):
     """执行 Stripe 支付流程。
 
     use_paypal / use_gopay 互斥：默认 card 路径，paypal 走 PayPal browser，
@@ -861,6 +861,8 @@ def pay(card_config_path, session_token=None, access_token=None,
         client_id = _codex_oauth_client_id_from_card_cfg(cfg_for_env)
         if client_id:
             env["OAUTH_CODEX_CLIENT_ID"] = client_id
+    if skip_post_payment_rt:
+        env["SKIP_POST_PAYMENT_CODEX_RT"] = "1"
 
     print(f"[pay] 启动支付 (mode={mode_label}) ...")
 
@@ -1137,7 +1139,7 @@ def _register_one(args_tuple):
             except Exception: pass
 
 
-def batch(card_config_path, count, delay=30, workers=1, **kwargs):
+def batch(card_config_path, count, delay=0, workers=1, **kwargs):
     """批量运行 N 次。可选 modifier:
        - register_only=True: 每次只 register（不付费），workers 串行
        - pay_only=True:      每次只 pay_only（复用未付账号），workers 串行
@@ -1498,6 +1500,23 @@ def _current_registered_account_status(account: dict | None) -> str:
         return ""
 
 
+def _current_registered_account_snapshot(account: dict | None) -> dict:
+    if not account:
+        return {}
+    account_id = account.get("id")
+    if not account_id:
+        return dict(account)
+    try:
+        return dict(get_db().get_registered_account(int(account_id)) or account)
+    except Exception:
+        return dict(account)
+
+
+def _registered_account_has_refresh_token(account: dict | None) -> bool:
+    current = _current_registered_account_snapshot(account)
+    return bool(str(current.get("refresh_token") or "").strip())
+
+
 def _preserve_higher_priority_account_status(account: dict | None, next_status: str) -> str:
     current_status = _current_registered_account_status(account)
     if current_status == "ADD_PHONE" and str(next_status or "").strip().upper() in {"SUCCESS", "UN_OAUTHED"}:
@@ -1602,6 +1621,7 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
             gopay_otp_file=gopay_otp_file,
             timeout=timeout_pay,
             stripe_fingerprint=stripe_fingerprint,
+            skip_post_payment_rt=True,
         )
         status = result.get("status", "unknown")
         raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
@@ -1610,21 +1630,13 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
         account_status = _payment_account_status(result)
         if account_status == "NO_TRIAL":
             record["payment"]["error"] = "total_summary.due is not 0"
-        if account_status == "SUCCESS" and _current_registered_account_status(account) == "UN_OAUTHED":
+        if account_status == "SUCCESS" and not _registered_account_has_refresh_token(account):
             account_status = "UN_OAUTHED"
         account_status = _preserve_higher_priority_account_status(account, account_status)
         _mark_registered_account_status(account, account_status)
         cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
         if use_gopay and status != "succeeded":
             _gopay_unlink_after_flow_failure(pay_email, cpa_cfg, status)
-        if status == "succeeded" and cpa_cfg.get("enabled"):
-            try:
-                sid = raw.get("session_id", "") if isinstance(raw, dict) else ""
-                cpa_status = _cpa_import_after_team(pay_email, sid, cpa_cfg)
-                record["cpa_import"] = cpa_status
-            except Exception as e:
-                print(f"[CPA] 导入异常: {e}")
-                record["cpa_import"] = "error"
         _append_result(record)
         if isinstance(result, dict):
             result["proxy"] = selected_proxy
@@ -4083,11 +4095,11 @@ def main():
     parser.add_argument("--register-only", action="store_true",
                         help="仅注册，不支付")
     parser.add_argument("--pay-only", action="store_true",
-                        help="仅支付（优先复用最近注册但未支付账号；没有则使用配置文件中的 session_token）")
+                        help="仅支付（成功缺 RT 时标记 UN_OAUTHED，后续用 --free-backfill-rt 授权补 RT）")
     parser.add_argument("--batch", type=int, default=0,
                         help="批量运行 N 次")
-    parser.add_argument("--delay", type=float, default=30,
-                        help="批量模式下每次间隔秒数 (默认 30)")
+    parser.add_argument("--delay", type=float, default=0,
+                        help="批量模式下每次间隔秒数 (默认 0)")
     parser.add_argument("--workers", type=int, default=3,
                         help="并行 worker 数 (默认 3)")
     parser.add_argument("--daemon", action="store_true",
@@ -4099,7 +4111,7 @@ def main():
     parser.add_argument("--free-register", action="store_true",
                         help="free_only 模式：循环注册免费 ChatGPT 号 + OAuth 拿 rt + 推 CPA(free)")
     parser.add_argument("--free-backfill-rt", action="store_true",
-                        help="free_only 模式：读数据库老号记录补 rt + 推 CPA(free)，跳过已 succeeded/dead")
+                        help="授权/补 RT：处理 UN_OAUTHED 老号并推 CPA，跳过已 succeeded/dead")
     parser.add_argument("--count", type=int, default=0, metavar="N",
                         help="--free-register 模式下注册 N 次后退出（0 = 无限）")
     args = parser.parse_args()

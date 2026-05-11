@@ -99,6 +99,7 @@ def test_inventory_summarizes_pay_and_rt_states(client):
     assert body["counts"]["rt_processed"] == 1
     assert body["counts"]["rt_cooldown"] == 1
     assert body["counts"]["rt_dead"] == 1
+    assert body["counts"]["rt_backfill_candidates"] == 0
     assert body["counts"]["status_success"] == 0
     assert body["counts"]["status_un_oauthed"] == 0
     assert body["counts"]["status_add_phone"] == 0
@@ -142,6 +143,7 @@ def test_inventory_counts_registered_account_statuses(client):
     assert counts["status_add_phone"] == 1
     assert counts["status_failed"] == 1
     assert counts["status_no_trial"] == 1
+    assert counts["rt_backfill_candidates"] == 1
 
 
 def test_delete_requires_auth(client):

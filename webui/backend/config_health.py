@@ -240,7 +240,7 @@ def _check_cloudflare_kv(checks: list[dict], req: dict) -> None:
             checks,
             "cloudflare_kv_secrets",
             "warn",
-            "Cloudflare KV OTP 凭证缺失；pay-only 支付可继续，但后续补 RT/CPA 可能失败",
+            "Cloudflare KV OTP 凭证缺失；pay-only 支付可继续，但后续授权/补 RT 可能失败",
             missing=missing,
             blocking=False,
             action="如果需要自动拿 refresh_token，请先补齐 Cloudflare KV 凭证",
@@ -475,7 +475,7 @@ def _check_free_backfill_inventory(checks: list[dict], req: dict) -> None:
     inv = build_accounts_inventory()
     counts = inv.get("counts") or {}
     total = int(counts.get("registered_total", 0) or 0)
-    candidates = int(counts.get("rt_missing", 0) or 0) + int(counts.get("rt_retryable", 0) or 0)
+    candidates = int(counts.get("rt_backfill_candidates", 0) or 0)
     if total <= 0:
         _check(
             checks,
@@ -490,11 +490,11 @@ def _check_free_backfill_inventory(checks: list[dict], req: dict) -> None:
             checks,
             "backfill_inventory",
             "warn",
-            "账号库存存在，但当前没有 RT 待补/可重试账号",
+            "账号库存存在，但当前没有待授权的 UN_OAUTHED 账号",
             blocking=False,
         )
     else:
-        _check(checks, "backfill_inventory", "ok", f"RT 待补/可重试账号 {candidates} 个", blocking=False)
+        _check(checks, "backfill_inventory", "ok", f"待授权 UN_OAUTHED 账号 {candidates} 个", blocking=False)
 
 
 def build_config_health(req: dict | None = None) -> dict:

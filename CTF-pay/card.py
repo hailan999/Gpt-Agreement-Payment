@@ -10183,8 +10183,13 @@ def run(
     except Exception:
         pass
 
-    # 支付成功才重新登录捕获 Codex localhost callback（失败不捕获）
-    if result_state == "succeeded" and chatgpt_email:
+    # 支付成功才重新登录捕获 Codex localhost callback（失败不捕获）。
+    # pay-only 由外层 pipeline 负责把缺 RT 账号标记为 UN_OAUTHED，再交给
+    # free_backfill_rt 单独补授权，因此这里允许外层显式跳过。
+    skip_post_payment_rt = str(os.environ.get("SKIP_POST_PAYMENT_CODEX_RT", "")).lower() in ("1", "true", "yes", "on")
+    if skip_post_payment_rt and result_state == "succeeded" and chatgpt_email:
+        _log("      [RT] SKIP_POST_PAYMENT_CODEX_RT=1，跳过支付内置 RT 捕获")
+    if result_state == "succeeded" and chatgpt_email and not skip_post_payment_rt:
         try:
             # 从 SQLite 主存储取本账号的 password。
             import os as _os
