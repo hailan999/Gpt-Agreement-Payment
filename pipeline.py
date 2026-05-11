@@ -1085,8 +1085,14 @@ def _run_one(args_tuple):
 
 
 def _run_one_pay_only(args_tuple):
-    """PayPal 并发模式下：注册已完成，只串行支付用（预留占位，batch 里不再单独使用）"""
-    return {"batch_index": args_tuple[0], "status": "error", "error": "deprecated path"}
+    """单个 pay-only 任务（供并行调度，账号领取由 SQLite 原子占用保护）"""
+    idx, card_config_path, kwargs = args_tuple
+    try:
+        r = pay_only(card_config_path, **kwargs)
+        r["batch_index"] = idx
+        return r
+    except Exception as e:
+        return {"batch_index": idx, "status": "error", "error": str(e)[:200]}
 
 
 def _register_one(args_tuple):
@@ -1181,18 +1187,50 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
         print(f"\n[batch] register-only 完成: {ok_count}/{count} 成功")
         return results
 
-    # ── pay-only batch：每次 pay_only（复用未付账号），串行
+    # ── pay-only batch：每次 pay_only（复用未付账号）；workers>1 时并行
     if is_pay_only:
-        print(f"\n[batch] === pay-only × {count} 串行 ===")
+        mode_label = "并行" if workers > 1 else "串行"
+        print(f"\n[batch] === pay-only × {count} {mode_label} (workers={workers}) ===")
         proxy_pool = _build_proxy_pool_from_card_cfg(card_cfg)
         if proxy_pool.proxies:
             print(f"[ProxyPool] 代理池大小={len(proxy_pool.proxies)}  rotation={proxy_pool.rotation}")
+        task_proxies = [
+            proxy_pool.pick() if proxy_pool and proxy_pool.proxies else ""
+            for _ in range(count)
+        ]
         results = []
         ok_count = 0
+        if workers > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            task_kwargs = []
+            for i in range(count):
+                task_kwargs.append({
+                    "use_paypal": use_paypal,
+                    "use_gopay": use_gopay,
+                    "gopay_otp_file": gopay_otp_file,
+                    "proxy_url": task_proxies[i],
+                })
+            results = [None] * count
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(_run_one_pay_only, (i, card_config_path, task_kwargs[i])): i
+                    for i in range(count)
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    r = future.result()
+                    results[idx] = r
+                    if isinstance(r, dict):
+                        r["proxy"] = r.get("proxy") or task_proxies[idx]
+                    if isinstance(r, dict) and r.get("status") == "succeeded":
+                        ok_count += 1
+                    print(f"[batch] 进度 {sum(1 for x in results if x is not None)}/{count}  累计 ok={ok_count}")
+            print(f"\n[batch] pay-only 完成: {ok_count}/{count} 成功")
+            return results
         for i in range(count):
             print(f"\n{'#'*60}\n# 批次 {i+1}/{count}  (pay-only)\n{'#'*60}")
             try:
-                picked_proxy = proxy_pool.pick() if proxy_pool and proxy_pool.proxies else ""
+                picked_proxy = task_proxies[i]
                 if picked_proxy:
                     print(f"[ProxyPool] 本次代理: {picked_proxy}")
                 r = pay_only(
@@ -1442,7 +1480,8 @@ def _mark_registered_account_status(account: dict | None, status: str) -> None:
     if not account_id:
         return
     try:
-        get_db().update_registered_account_status(int(account_id), status)
+        if get_db().update_registered_account_status(int(account_id), status):
+            print(f"[pay-only] registered_accounts id={account_id} status -> {str(status or '').strip().upper()}")
     except Exception as e:
         print(f"[pay-only] 更新账号状态失败 id={account_id}: {e}")
 
@@ -1467,37 +1506,26 @@ def _preserve_higher_priority_account_status(account: dict | None, next_status: 
 
 
 def _select_recent_registered_account_for_pay_only(target_email: str = "") -> dict | None:
-    """Pick the newest registered account whose status is INITIAL.
+    """Atomically claim the newest registered account whose status is INITIAL.
 
     The selected account is returned with its original
-    session/access/device credentials from SQLite.
+    session/access/device credentials from SQLite and status PROCESSING.
     """
     target_email = _norm_email(target_email)
-    accounts = _load_registered_accounts()
-    if not accounts:
-        return None
-
     consumed = _paid_or_consumed_emails()
-    seen: set[str] = set()
-    for acc in reversed(accounts):
-        if not isinstance(acc, dict):
-            continue
-        email = _norm_email(acc.get("email"))
-        if not email or email in seen:
-            continue
-        if target_email and email != target_email:
-            continue
-        seen.add(email)
-        if _registered_account_status(acc) != "INITIAL":
-            continue
-        if email in consumed:
-            continue
-        if not (acc.get("session_token") or acc.get("access_token")):
-            continue
-        selected = dict(acc)
-        selected["email"] = email
-        return selected
-    return None
+    try:
+        selected = get_db().claim_registered_account_for_pay_only(
+            target_email=target_email,
+            excluded_emails=sorted(consumed),
+        )
+    except AttributeError:
+        selected = {}
+    if not selected:
+        return None
+    selected = dict(selected)
+    selected["email"] = _norm_email(selected.get("email"))
+    print(f"[pay-only] registered_accounts id={selected.get('id')} status -> PROCESSING")
+    return selected
 
 
 def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,

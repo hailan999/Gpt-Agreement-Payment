@@ -188,6 +188,12 @@ def build_accounts_inventory() -> dict:
         "rt_retryable": 0,
         "rt_cooldown": 0,
         "rt_dead": 0,
+        "status_success": 0,
+        "status_un_oauthed": 0,
+        "status_add_phone": 0,
+        "status_failed": 0,
+        "status_no_trial": 0,
+        "status_processing": 0,
     }
 
     for acc in accounts:
@@ -196,8 +202,20 @@ def build_accounts_inventory() -> dict:
         has_access = bool(acc.get("access_token"))
         has_auth = has_session or has_access
         account_status = str(acc.get("status") or "INITIAL").upper()
+        if account_status == "SUCCESS":
+            counts["status_success"] += 1
+        elif account_status == "UN_OAUTHED":
+            counts["status_un_oauthed"] += 1
+        elif account_status == "ADD_PHONE":
+            counts["status_add_phone"] += 1
+        elif account_status == "FAILED":
+            counts["status_failed"] += 1
+        elif account_status == "NO_TRIAL":
+            counts["status_no_trial"] += 1
+        elif account_status == "PROCESSING":
+            counts["status_processing"] += 1
         has_rt = email in rt_emails
-        consumed = email in consumed_emails or account_status in ("SUCCESS", "FAILED", "NO_TRIAL")
+        consumed = email in consumed_emails or account_status in ("SUCCESS", "FAILED", "NO_TRIAL", "PROCESSING")
         oauth = oauth_map.get(email.lower()) or oauth_map.get(email) or {}
         latest = latest_payment.get(email) or {}
         error = str(latest.get("error") or "")

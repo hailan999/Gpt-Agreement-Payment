@@ -6400,6 +6400,50 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                 except Exception as e:
                     _log(f"      [RT] {label} 页面状态读取失败: {e}")
 
+            def _auth_body_text_lower() -> str:
+                try:
+                    return (page.evaluate("() => (document.body && document.body.innerText || '')") or "").lower()
+                except Exception:
+                    return ""
+
+            def _password_error_visible() -> bool:
+                body = _auth_body_text_lower()
+                return (
+                    "incorrect email address or password" in body or
+                    "incorrect password" in body or
+                    "wrong password" in body
+                )
+
+            def _click_one_time_code_login(label: str) -> bool:
+                clicked = _click_first_visible([
+                    'button:has-text("Log in with a one-time code")',
+                    'button:has-text("one-time code")',
+                    'a:has-text("Log in with a one-time code")',
+                    '[role="button"]:has-text("one-time code")',
+                    'text="Log in with a one-time code"',
+                ], label)
+                if clicked:
+                    return True
+                try:
+                    clicked = bool(page.evaluate("""
+                        () => {
+                            const nodes = Array.from(document.querySelectorAll('button,a,[role="button"]'));
+                            const target = nodes.find((el) => {
+                                const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                                const visible = !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                                return visible && text.includes('one-time code');
+                            });
+                            if (!target) return false;
+                            target.click();
+                            return true;
+                        }
+                    """))
+                    if clicked:
+                        _log(f"      [RT] {label}: text contains one-time code")
+                    return clicked
+                except Exception:
+                    return False
+
             # localhost 拦截
             def _intercept(route):
                 url = route.request.url
@@ -6472,29 +6516,16 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                 _log(f"      [RT] 邮箱填写失败: {e}")
                 return ""
 
-            # [3] 填密码（OpenAI 现在很多场景走 passwordless，没密码就直接等 OTP）
+            # [3] 登录页优先走 passwordless OTP，不再尝试数据库里的旧密码。
             if password:
                 try:
                     page.wait_for_selector('input[type="password"]', state="visible", timeout=15000)
-                    pwd_input = page.query_selector('input[type="password"]:visible')
-                    pwd_input.click(); time.sleep(0.3)
-                    pwd_input.fill(password)
-                    time.sleep(random.uniform(0.5, 1.2))
-                    clicked_pwd_continue = _click_first_visible([
-                        'button[type="submit"]',
-                        'button:has-text("Continue")',
-                        'button:has-text("Log in")',
-                        'button:has-text("Sign in")',
-                        '[data-testid*="continue"]',
-                        '[data-testid*="submit"]',
-                    ], "密码提交")
-                    if not clicked_pwd_continue:
-                        try:
-                            pwd_input.press("Enter")
-                            _log("      [RT] 密码提交: Enter")
-                        except Exception:
-                            pass
-                    time.sleep(5)
+                    _log_auth_page_state("进入 password 页，直接切换一次性验证码登录")
+                    if _click_one_time_code_login("password 页直接切换 OTP"):
+                        otp_sent_ts = time.time()
+                    else:
+                        _log("      [RT] password 页未找到一次性验证码入口，按 passwordless/OTP 路径继续等待")
+                    time.sleep(3)
                 except Exception as e:
                     _log(f"      [RT] 密码框超时（passwordless 路径），跳过到 OTP 等待: {str(e)[:80]}")
                     _safe_screenshot(page, "/tmp/rt_pwd_skip.png")
@@ -6511,6 +6542,8 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
             last_log_ts = 0.0
             login_stuck_since = None
             login_retry_count = 0
+            password_stuck_since = None
+            passwordless_requested = False
 
             def _fill_email_verification_register_profile() -> bool:
                 name_input = (
@@ -6581,7 +6614,26 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                         page.query_selector('input[autocomplete="one-time-code"]:visible') or
                         page.query_selector('input[inputmode="numeric"]:visible')
                     )
-                    if not has_password and not has_otp:
+                    if "/log-in/password" in cur and not has_otp:
+                        if password_stuck_since is None:
+                            password_stuck_since = time.time()
+                        if not passwordless_requested and (
+                            _password_error_visible() or time.time() - password_stuck_since > 3
+                        ):
+                            passwordless_requested = True
+                            _log_auth_page_state("password 页切换一次性验证码登录")
+                            if _click_one_time_code_login("password 页切换 OTP"):
+                                otp_sent_ts = time.time()
+                                password_stuck_since = None
+                                time.sleep(3)
+                                continue
+                            _log("      [RT] password 页未找到一次性验证码入口，继续等待")
+                            time.sleep(3)
+                        if time.time() - password_stuck_since > 20:
+                            _safe_screenshot(page, "/tmp/rt_password_stuck.png")
+                            _log("      [RT] password 页 20s 未推进到 OTP/callback，提前结束 RT 捕获")
+                            break
+                    elif not has_password and not has_otp:
                         if login_stuck_since is None:
                             login_stuck_since = time.time()
                         if login_retry_count < 3 and time.time() - login_stuck_since > 8 * (login_retry_count + 1):
@@ -6611,6 +6663,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                             break
                     else:
                         login_stuck_since = None
+                        password_stuck_since = None
                 # OTP 页
                 if ("/email-otp" in cur or "passwordless" in cur or
                     page.query_selector('input[autocomplete="one-time-code"]') or

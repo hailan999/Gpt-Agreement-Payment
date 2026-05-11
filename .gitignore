@@ -68,3 +68,9 @@ test_*.py
 !webui/tests/test_*.py
 cpas/
 data/notifications.jsonl
+123.txt
+sub2api*.json
+Webshare residential proxies.txt
+webshare-mihomo-merge.yaml
+data/notifications.jsonl
+

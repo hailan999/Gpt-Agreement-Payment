@@ -99,6 +99,11 @@ def test_inventory_summarizes_pay_and_rt_states(client):
     assert body["counts"]["rt_processed"] == 1
     assert body["counts"]["rt_cooldown"] == 1
     assert body["counts"]["rt_dead"] == 1
+    assert body["counts"]["status_success"] == 0
+    assert body["counts"]["status_un_oauthed"] == 0
+    assert body["counts"]["status_add_phone"] == 0
+    assert body["counts"]["status_failed"] == 0
+    assert body["counts"]["status_no_trial"] == 0
 
     by_email = {acc["email"]: acc for acc in body["accounts"]}
     assert by_email["paid@example.com"]["pay_state"] == "consumed"
@@ -113,6 +118,30 @@ def test_inventory_summarizes_pay_and_rt_states(client):
         assert "id" in acc and isinstance(acc["id"], int)
         assert acc["last_check_status"] == ""
         assert acc["last_check_at"] == 0
+
+
+def test_inventory_counts_registered_account_statuses(client):
+    _login(client)
+    db = get_db()
+    db.clear_runtime_data()
+
+    for status in ("SUCCESS", "UN_OAUTHED", "ADD_PHONE", "FAILED", "NO_TRIAL"):
+        db.add_registered_account({
+            "email": f"{status.lower()}@example.com",
+            "session_token": "sess",
+            "access_token": "at",
+            "status": status,
+        })
+
+    r = client.get("/api/inventory/accounts")
+
+    assert r.status_code == 200
+    counts = r.json()["counts"]
+    assert counts["status_success"] == 1
+    assert counts["status_un_oauthed"] == 1
+    assert counts["status_add_phone"] == 1
+    assert counts["status_failed"] == 1
+    assert counts["status_no_trial"] == 1
 
 
 def test_delete_requires_auth(client):

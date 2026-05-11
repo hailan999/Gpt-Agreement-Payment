@@ -356,6 +356,81 @@ class Database:
             )
         return cur.rowcount > 0
 
+    def claim_registered_account_for_pay_only(
+        self,
+        target_email: str = "",
+        excluded_emails: list[str] | None = None,
+    ) -> dict:
+        """Atomically claim the newest reusable account for pay-only work.
+
+        The claim flips status INITIAL -> PROCESSING inside a write transaction
+        so concurrent workers cannot pick the same registered_accounts row.
+        """
+        target = _email(target_email)
+        excluded = {_email(e) for e in (excluded_emails or []) if _email(e)}
+        with self._conn() as c:
+            try:
+                c.execute("BEGIN IMMEDIATE")
+                params: list[Any] = []
+                where = ""
+                if target:
+                    where = "WHERE lower(email) = ?"
+                    params.append(target)
+                rows = c.execute(
+                    f"""
+                    SELECT id, email, ts, password, session_token, access_token, device_id,
+                           csrf_token, id_token, refresh_token, cookie_header,
+                           proxy_add, hot_client, hot_rt, status,
+                           last_check_at, last_check_status, last_check_message
+                    FROM registered_accounts
+                    {where}
+                    ORDER BY id DESC
+                    """,
+                    params,
+                ).fetchall()
+                seen: set[str] = set()
+                for row in rows:
+                    email = _email(row["email"])
+                    if not email or email in seen:
+                        continue
+                    seen.add(email)
+                    if email in excluded:
+                        continue
+                    if _text(row["status"]).strip().upper() != "INITIAL":
+                        continue
+                    if not (row["session_token"] or row["access_token"]):
+                        continue
+                    cur = c.execute(
+                        """
+                        UPDATE registered_accounts
+                        SET status = 'PROCESSING'
+                        WHERE id = ? AND upper(coalesce(status, 'INITIAL')) = 'INITIAL'
+                        """,
+                        (int(row["id"]),),
+                    )
+                    if cur.rowcount <= 0:
+                        continue
+                    claimed = c.execute(
+                        """
+                        SELECT id, email, ts, password, session_token, access_token, device_id,
+                               csrf_token, id_token, refresh_token, cookie_header,
+                               proxy_add, hot_client, hot_rt, status,
+                               last_check_at, last_check_status, last_check_message
+                        FROM registered_accounts WHERE id = ?
+                        """,
+                        (int(row["id"]),),
+                    ).fetchone()
+                    c.execute("COMMIT")
+                    return dict(claimed) if claimed else {}
+                c.execute("COMMIT")
+                return {}
+            except Exception:
+                try:
+                    c.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
     def update_registered_account_refresh_token(self, account_id: int, refresh_token: str) -> bool:
         refresh_token = _text(refresh_token)
         if not refresh_token:

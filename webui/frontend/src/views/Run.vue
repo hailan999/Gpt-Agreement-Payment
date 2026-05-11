@@ -105,6 +105,16 @@
             <span class="status-dot idle">○</span> 空闲
           </span>
         </div>
+
+        <div class="run-status-panel">
+          <div class="run-status-title">本次运行状态</div>
+          <div class="run-status-grid">
+            <div v-for="item in runStatusItems" :key="item.key" class="run-status-item" :class="item.className">
+              <span>{{ item.label }}</span>
+              <strong>{{ item.value }}</strong>
+            </div>
+          </div>
+        </div>
       </section>
 
       <section class="run-inventory">
@@ -171,6 +181,7 @@
             <div class="inventory-row-top">
               <input type="checkbox" class="inventory-row-check" :checked="isSelected(acc.id)" @change="toggleSelect(acc.id)" />
               <span class="inventory-email">{{ acc.email }}</span>
+              <span class="badge" :class="accountStatusBadgeClass(acc.account_status)">{{ acc.account_status }}</span>
               <span class="badge" :class="planBadgeClass(acc.plan_tag)">{{ planLabel(acc.plan_tag) }}</span>
               <span class="badge" :class="checkBadgeClass(acc.last_check_status)" :title="acc.last_check_message">
                 <template v-if="checkingIds.has(acc.id)">⟳ 检查中</template>
@@ -295,6 +306,7 @@ interface InventoryAccount {
   has_access_token: boolean;
   has_device_id: boolean;
   has_refresh_token: boolean;
+  account_status: "SUCCESS" | "UN_OAUTHED" | "ADD_PHONE" | "FAILED" | "NO_TRIAL" | "PROCESSING" | "INITIAL" | string;
   pay_state: "reusable" | "consumed" | "no_auth";
   pay_only_eligible: boolean;
   rt_state: "has_rt" | "oauth_succeeded" | "dead" | "cooldown" | "retryable" | "missing";
@@ -331,6 +343,12 @@ interface InventoryResponse {
     rt_retryable: number;
     rt_cooldown: number;
     rt_dead: number;
+    status_success: number;
+    status_un_oauthed: number;
+    status_add_phone: number;
+    status_failed: number;
+    status_no_trial: number;
+    status_processing: number;
   };
   accounts: InventoryAccount[];
 }
@@ -355,6 +373,8 @@ interface ConfigHealthResponse {
   checks: ConfigHealthCheck[];
   blocking: ConfigHealthCheck[];
 }
+
+type RunTerminalStatus = "SUCCESS" | "UN_OAUTHED" | "ADD_PHONE" | "FAILED" | "NO_TRIAL" | "PROCESSING";
 
 const form = ref({
   mode: (router.currentRoute.value.query.mode as string) || "single",
@@ -381,6 +401,7 @@ const status = ref<RunStatus>({
 
 const cmdPreview = ref("xvfb-run -a python pipeline.py --config CTF-pay/config.paypal.json --paypal");
 const lines = ref<{ seq: number; ts: number; line: string }[]>([]);
+const runStatusByAccount = ref<Record<string, RunTerminalStatus>>({});
 const starting = ref(false);
 const stopping = ref(false);
 const configHealth = ref<ConfigHealthResponse | null>(null);
@@ -401,6 +422,12 @@ const inventory = ref<InventoryResponse>({
     rt_retryable: 0,
     rt_cooldown: 0,
     rt_dead: 0,
+    status_success: 0,
+    status_un_oauthed: 0,
+    status_add_phone: 0,
+    status_failed: 0,
+    status_no_trial: 0,
+    status_processing: 0,
   },
   accounts: [],
 });
@@ -437,6 +464,26 @@ const runtimeText = computed(() => {
 const inventoryUpdatedText = computed(() =>
   inventory.value.generated_at ? formatInventoryTs(inventory.value.generated_at) : "未刷新"
 );
+const runStatusCounts = computed<Record<RunTerminalStatus, number>>(() => {
+  const counts: Record<RunTerminalStatus, number> = {
+    SUCCESS: 0,
+    UN_OAUTHED: 0,
+    ADD_PHONE: 0,
+    FAILED: 0,
+    NO_TRIAL: 0,
+    PROCESSING: 0,
+  };
+  for (const value of Object.values(runStatusByAccount.value)) counts[value] += 1;
+  return counts;
+});
+const runStatusItems = computed(() => [
+  { key: "success", label: "SUCCESS", value: runStatusCounts.value.SUCCESS, className: "status-success" },
+  { key: "un_oauthed", label: "UN_OAUTHED", value: runStatusCounts.value.UN_OAUTHED, className: "status-un-oauthed" },
+  { key: "add_phone", label: "ADD_PHONE", value: runStatusCounts.value.ADD_PHONE, className: "status-add-phone" },
+  { key: "failed", label: "FAILED", value: runStatusCounts.value.FAILED, className: "status-failed" },
+  { key: "no_trial", label: "NO_TRIAL", value: runStatusCounts.value.NO_TRIAL, className: "status-no-trial" },
+  { key: "processing", label: "PROCESSING", value: runStatusCounts.value.PROCESSING, className: "status-processing" },
+]);
 
 const visibleHealthChecks = computed(() => {
   const checks = configHealth.value?.checks || [];
@@ -514,6 +561,17 @@ function rtBadgeClass(state: InventoryAccount["rt_state"]) {
   return "badge-warn";
 }
 
+function accountStatusBadgeClass(status: string) {
+  const s = String(status || "").toUpperCase();
+  if (s === "SUCCESS") return "badge-ok";
+  if (s === "UN_OAUTHED") return "badge-warn";
+  if (s === "ADD_PHONE") return "badge-phone";
+  if (s === "FAILED") return "badge-err";
+  if (s === "NO_TRIAL") return "badge-no-trial";
+  if (s === "PROCESSING") return "badge-warn";
+  return "badge-ghost";
+}
+
 function healthStatusLabel(status: ConfigHealthCheck["status"]) {
   if (status === "ok") return "OK";
   if (status === "warn") return "WARN";
@@ -532,6 +590,32 @@ function logClass(line: string) {
   if (/\b(WARN|WARNING)\b/i.test(line)) return "log-warn";
   if (/\b(OK|SUCCESS|✓|完成|成功)\b/i.test(line)) return "log-ok";
   return "";
+}
+
+function resetRunStatusStats() {
+  runStatusByAccount.value = {};
+}
+
+function setRunAccountStatus(key: string, nextStatus: RunTerminalStatus) {
+  if (!key) return;
+  runStatusByAccount.value = { ...runStatusByAccount.value, [key]: nextStatus };
+}
+
+function absorbRunStatusFromLine(rawLine: string) {
+  const line = String(rawLine || "");
+  const direct = line.match(/registered_accounts\s+id=(\d+)\s+status\s*->\s*(SUCCESS|UN_OAUTHED|ADD_PHONE|FAILED|NO_TRIAL|PROCESSING)\b/i);
+  if (direct) {
+    setRunAccountStatus(`id:${direct[1]}`, direct[2].toUpperCase() as RunTerminalStatus);
+    return;
+  }
+
+  const freeLine = line.match(/\b(?:register|backfill)\s+([^\s]+)\s+→\s+(succeeded|ADD_PHONE|dead)\b/i);
+  if (freeLine) {
+    const mapped = freeLine[2].toLowerCase() === "succeeded"
+      ? "SUCCESS"
+      : (freeLine[2].toLowerCase() === "dead" ? "FAILED" : "ADD_PHONE");
+    setRunAccountStatus(`email:${freeLine[1].toLowerCase()}`, mapped as RunTerminalStatus);
+  }
 }
 
 // ── 库存：选择 + 验证 + 删除 ─────────────────────────────────
@@ -735,6 +819,7 @@ async function start() {
     await api.post("/run/start", form.value);
     message.success("已启动");
     lines.value = [];
+    resetRunStatusStats();
     await refreshStatus();
     await refreshInventory();
     openStream();
@@ -766,6 +851,7 @@ function openStream() {
     try {
       const entry = JSON.parse((e as MessageEvent).data);
       lines.value.push(entry);
+      absorbRunStatusFromLine(String(entry?.line || ""));
       const line = String(entry?.line || "").toLowerCase();
       if (line.includes("[gopay] whatsapp otp received")) {
         otpDialog.value.open = false;
@@ -1003,6 +1089,45 @@ onBeforeUnmount(() => {
 .status-dot.ok { color: var(--ok); }
 .status-dot.err { color: var(--err); }
 .status-dot.idle { color: var(--fg-tertiary); }
+.run-status-panel {
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  padding: 10px 12px;
+}
+.run-status-title {
+  color: var(--fg-tertiary);
+  font-size: 11px;
+  margin-bottom: 8px;
+}
+.run-status-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+}
+.run-status-item {
+  min-width: 0;
+  border-left: 2px solid var(--border);
+  padding-left: 6px;
+}
+.run-status-item span {
+  display: block;
+  color: var(--fg-tertiary);
+  font-size: 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.run-status-item strong {
+  color: var(--fg-primary);
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+}
+.run-status-item.status-success { border-left-color: var(--ok); }
+.run-status-item.status-un-oauthed { border-left-color: var(--warn); }
+.run-status-item.status-add-phone { border-left-color: #2563eb; }
+.run-status-item.status-failed { border-left-color: var(--err); }
+.run-status-item.status-no-trial { border-left-color: #7c3aed; }
+.run-status-item.status-processing { border-left-color: var(--warn); }
 
 .inventory-divider { margin-top: 22px; }
 .inventory-head {
@@ -1161,6 +1286,8 @@ onBeforeUnmount(() => {
 .badge-warn { border-color: var(--warn); color: var(--warn); }
 .badge-err { border-color: var(--err); color: var(--err); }
 .badge-ghost { border-color: var(--border); color: var(--fg-tertiary); }
+.badge-phone { border-color: #2563eb; color: #2563eb; }
+.badge-no-trial { border-color: #7c3aed; color: #7c3aed; }
 .badge-plus { border-color: #2563eb; color: #2563eb; }
 .badge-team { border-color: #7c3aed; color: #7c3aed; }
 .inventory-row-action {
